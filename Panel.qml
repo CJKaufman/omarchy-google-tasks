@@ -131,6 +131,7 @@ Panel {
     var clean = String(title || "").trim()
     if (clean === "" || !root.authenticated) return
     var targetList = root.activeListId || (root.taskLists && root.taskLists.length > 0 ? root.taskLists[0].id : "@default")
+    root.statusError = ""
     // Optimistic UI addition
     var tempTask = {
       id: "temp_" + Date.now(),
@@ -140,6 +141,7 @@ Panel {
       due: ""
     }
     root.tasks = [tempTask].concat(root.tasks || [])
+    createTaskProc.running = false
     createTaskProc.inputPayload = JSON.stringify({
       action: "create-task",
       list_id: targetList,
@@ -725,12 +727,23 @@ Panel {
               anchors.rightMargin: Style.space(8)
               spacing: Style.space(6)
 
-              Text {
-                text: root.glyphAdd
-                textFormat: Text.PlainText
-                color: root.accent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
+              MouseArea {
+                implicitWidth: Style.space(24)
+                implicitHeight: Style.space(24)
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  root.quickAddTask(addField.text)
+                  addField.text = ""
+                }
+
+                Text {
+                  anchors.centerIn: parent
+                  text: root.glyphAdd
+                  textFormat: Text.PlainText
+                  color: root.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
               }
 
               TextField {
@@ -741,9 +754,20 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
                 background: null
+                selectByMouse: true
                 onAccepted: {
                   root.quickAddTask(text)
                   text = ""
+                }
+                Keys.onReturnPressed: function(event) {
+                  root.quickAddTask(text)
+                  text = ""
+                  event.accepted = true
+                }
+                Keys.onEnterPressed: function(event) {
+                  root.quickAddTask(text)
+                  text = ""
+                  event.accepted = true
                 }
               }
             }
