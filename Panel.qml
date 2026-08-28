@@ -576,7 +576,7 @@ Panel {
             width: parent.width
             implicitHeight: settingsCol.implicitHeight + Style.space(20)
             color: root.subtleBg
-            radius: Style.radius(8)
+            radius: 8
             border.color: root.borderCol
             border.width: 1
 
@@ -621,7 +621,7 @@ Panel {
                   background: Rectangle {
                     color: root.cardBg
                     border.color: root.borderCol
-                    radius: Style.radius(4)
+                    radius: 4
                   }
                 }
 
@@ -636,7 +636,7 @@ Panel {
                   background: Rectangle {
                     color: root.cardBg
                     border.color: root.borderCol
-                    radius: Style.radius(4)
+                    radius: 4
                   }
                 }
 
@@ -682,7 +682,7 @@ Panel {
                       implicitWidth: listLabel.implicitWidth + Style.space(16)
                       implicitHeight: Style.space(26)
                       color: root.activeListId === modelData.id ? root.accent : root.cardBg
-                      radius: Style.radius(13)
+                      radius: 13
                       border.color: root.borderCol
 
                       Text {
@@ -717,7 +717,7 @@ Panel {
             width: parent.width
             implicitHeight: Style.space(38)
             color: root.cardBg
-            radius: Style.radius(6)
+            radius: 6
             border.color: addField.activeFocus ? root.accent : root.borderCol
             border.width: 1
 
@@ -786,7 +786,7 @@ Panel {
                 width: parent.width
                 implicitHeight: cardContent.implicitHeight + Style.space(14)
                 color: root.cardBg
-                radius: Style.radius(6)
+                radius: 6
                 border.color: root.borderCol
                 border.width: 1
 
@@ -806,9 +806,9 @@ Panel {
 
                     Text {
                       anchors.centerIn: parent
-                      text: modelData.status === "completed" || root.optimisticallyCompleted[modelData.id] ? root.glyphChecked : root.glyphUnchecked
+                      text: (modelData && modelData.status === "completed") || Boolean(root.optimisticallyCompleted && root.optimisticallyCompleted[modelData.id]) ? root.glyphChecked : root.glyphUnchecked
                       textFormat: Text.PlainText
-                      color: modelData.status === "completed" || root.optimisticallyCompleted[modelData.id] ? root.accent : root.dim
+                      color: (modelData && modelData.status === "completed") || Boolean(root.optimisticallyCompleted && root.optimisticallyCompleted[modelData.id]) ? root.accent : root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                     }
@@ -821,19 +821,19 @@ Panel {
 
                     Text {
                       Layout.fillWidth: true
-                      text: String(modelData.title || "")
+                      text: String((modelData && modelData.title) || "")
                       textFormat: Text.PlainText
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
                       wrapMode: Text.WordWrap
-                      font.strikeout: modelData.status === "completed" || root.optimisticallyCompleted[modelData.id]
+                      font.strikeout: (modelData && modelData.status === "completed") || Boolean(root.optimisticallyCompleted && root.optimisticallyCompleted[modelData.id])
                     }
 
                     Text {
-                      visible: modelData.notes && String(modelData.notes).trim() !== ""
+                      visible: Boolean(modelData && modelData.notes && String(modelData.notes).trim() !== "")
                       Layout.fillWidth: true
-                      text: String(modelData.notes || "")
+                      text: String((modelData && modelData.notes) || "")
                       textFormat: Text.PlainText
                       color: root.dim
                       font.family: root.fontFamily
@@ -845,11 +845,11 @@ Panel {
 
                   // Due Badge
                   Rectangle {
-                    visible: modelData.due && String(modelData.due) !== ""
+                    visible: Boolean(modelData && modelData.due && String(modelData.due) !== "")
                     implicitWidth: dueText.implicitWidth + Style.space(10)
                     implicitHeight: Style.space(20)
-                    radius: Style.radius(10)
-                    color: root.isOverdue(modelData.due) ? root.urgent : (root.isDueToday(modelData.due) ? root.accent : root.subtleBg)
+                    radius: 10
+                    color: root.isOverdue(modelData ? modelData.due : "") ? root.urgent : (root.isDueToday(modelData ? modelData.due : "") ? root.accent : root.subtleBg)
 
                     Text {
                       id: dueText
