@@ -129,7 +129,8 @@ Panel {
 
   function quickAddTask(title) {
     var clean = String(title || "").trim()
-    if (clean === "" || !root.authenticated || root.activeListId === "" || createTaskProc.running) return
+    if (clean === "" || !root.authenticated) return
+    var targetList = root.activeListId || (root.taskLists && root.taskLists.length > 0 ? root.taskLists[0].id : "@default")
     // Optimistic UI addition
     var tempTask = {
       id: "temp_" + Date.now(),
@@ -141,7 +142,7 @@ Panel {
     root.tasks = [tempTask].concat(root.tasks || [])
     createTaskProc.inputPayload = JSON.stringify({
       action: "create-task",
-      list_id: root.activeListId,
+      list_id: targetList,
       title: clean
     })
     createTaskProc.running = true
@@ -149,13 +150,14 @@ Panel {
 
   function toggleTaskComplete(task) {
     if (!task || !task.id || !root.authenticated) return
+    var targetList = root.activeListId || (root.taskLists && root.taskLists.length > 0 ? root.taskLists[0].id : "@default")
     var updated = Object.assign({}, root.optimisticallyCompleted)
     if (task.status === "needsAction") {
       updated[task.id] = true
       root.optimisticallyCompleted = updated
       completeTaskProc.inputPayload = JSON.stringify({
         action: "complete-task",
-        list_id: root.activeListId,
+        list_id: targetList,
         task_id: task.id
       })
       completeTaskProc.running = true
@@ -164,7 +166,7 @@ Panel {
       root.optimisticallyCompleted = updated
       uncompleteTaskProc.inputPayload = JSON.stringify({
         action: "uncomplete-task",
-        list_id: root.activeListId,
+        list_id: targetList,
         task_id: task.id
       })
       uncompleteTaskProc.running = true
@@ -173,11 +175,12 @@ Panel {
 
   function deleteTask(task) {
     if (!task || !task.id || !root.authenticated || deleteTaskProc.running) return
+    var targetList = root.activeListId || (root.taskLists && root.taskLists.length > 0 ? root.taskLists[0].id : "@default")
     // Optimistically remove from local tasks array
     root.tasks = (root.tasks || []).filter(function(t) { return t.id !== task.id })
     deleteTaskProc.inputPayload = JSON.stringify({
       action: "delete-task",
-      list_id: root.activeListId,
+      list_id: targetList,
       task_id: task.id
     })
     deleteTaskProc.running = true
@@ -194,11 +197,16 @@ Panel {
     authProc.running = true
   }
 
+  Component.onCompleted: {
+    root.checkStatus()
+  }
+
   onOpenedChanged: {
     if (opened) {
       checkStatus()
       if (root.authenticated) {
-        fetchTasks()
+        if (root.taskLists.length === 0) root.fetchLists()
+        else root.fetchTasks()
       }
     }
   }
@@ -301,6 +309,21 @@ Panel {
         }
       }
     }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.scanning = false
+        if (text && text.trim() !== "") {
+          console.warn("listTasksProc error:", text)
+          try {
+            var err = JSON.parse(text)
+            root.statusError = String(err.error || text).substring(0, 250)
+          } catch (e) {
+            root.statusError = String(text).substring(0, 250)
+          }
+        }
+      }
+    }
   }
 
   Process {
@@ -312,6 +335,20 @@ Panel {
       if (inputPayload) write(inputPayload + "\n")
     }
     onExited: root.fetchTasks()
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") {
+          console.warn("createTaskProc error:", text)
+          try {
+            var err = JSON.parse(text)
+            root.statusError = String(err.error || text).substring(0, 250)
+          } catch (e) {
+            root.statusError = String(text).substring(0, 250)
+          }
+        }
+      }
+    }
   }
 
   Process {
@@ -323,6 +360,14 @@ Panel {
       if (inputPayload) write(inputPayload + "\n")
     }
     onExited: root.fetchTasks()
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") {
+          console.warn("completeTaskProc error:", text)
+        }
+      }
+    }
   }
 
   Process {
@@ -334,6 +379,14 @@ Panel {
       if (inputPayload) write(inputPayload + "\n")
     }
     onExited: root.fetchTasks()
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") {
+          console.warn("uncompleteTaskProc error:", text)
+        }
+      }
+    }
   }
 
   Process {
@@ -345,6 +398,14 @@ Panel {
       if (inputPayload) write(inputPayload + "\n")
     }
     onExited: root.fetchTasks()
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") {
+          console.warn("deleteTaskProc error:", text)
+        }
+      }
+    }
   }
 
   Process {

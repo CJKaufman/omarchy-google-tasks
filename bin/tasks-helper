@@ -290,9 +290,7 @@ def handle_action(req):
         return lists
 
     elif action == "list-tasks":
-        list_id = str(req.get("list_id", "")).strip()
-        if not list_id:
-            raise ValueError("Missing list_id")
+        list_id = str(req.get("list_id", "")).strip() or "@default"
         show_completed = bool(req.get("show_completed", False))
         params = {
             "showCompleted": "true" if show_completed else "false",
@@ -316,10 +314,10 @@ def handle_action(req):
         return items
 
     elif action == "create-task":
-        list_id = str(req.get("list_id", "")).strip()
+        list_id = str(req.get("list_id", "")).strip() or "@default"
         title = str(req.get("title", "")).strip()[:MAX_TITLE_LEN]
-        if not list_id or not title:
-            raise ValueError("Missing list_id or title")
+        if not title:
+            raise ValueError("Missing title")
         body = {"title": title}
         if req.get("notes"):
             body["notes"] = str(req.get("notes"))[:MAX_NOTES_LEN]
@@ -334,28 +332,28 @@ def handle_action(req):
         }
 
     elif action == "complete-task":
-        list_id = str(req.get("list_id", "")).strip()
+        list_id = str(req.get("list_id", "")).strip() or "@default"
         task_id = str(req.get("task_id", "")).strip()
-        if not list_id or not task_id:
-            raise ValueError("Missing list_id or task_id")
+        if not task_id:
+            raise ValueError("Missing task_id")
         body = {"id": task_id, "status": "completed"}
         api_request(f"/lists/{list_id}/tasks/{task_id}", method="PATCH", body=body)
         return {"status": "ok", "id": task_id}
 
     elif action == "uncomplete-task":
-        list_id = str(req.get("list_id", "")).strip()
+        list_id = str(req.get("list_id", "")).strip() or "@default"
         task_id = str(req.get("task_id", "")).strip()
-        if not list_id or not task_id:
-            raise ValueError("Missing list_id or task_id")
+        if not task_id:
+            raise ValueError("Missing task_id")
         body = {"id": task_id, "status": "needsAction", "completed": None}
         api_request(f"/lists/{list_id}/tasks/{task_id}", method="PATCH", body=body)
         return {"status": "ok", "id": task_id}
 
     elif action == "delete-task":
-        list_id = str(req.get("list_id", "")).strip()
+        list_id = str(req.get("list_id", "")).strip() or "@default"
         task_id = str(req.get("task_id", "")).strip()
-        if not list_id or not task_id:
-            raise ValueError("Missing list_id or task_id")
+        if not task_id:
+            raise ValueError("Missing task_id")
         api_request(f"/lists/{list_id}/tasks/{task_id}", method="DELETE")
         return {"status": "ok", "deleted": task_id}
 
