@@ -29,17 +29,19 @@ Because Google Tasks contains personal data, each user connects using their own 
 1. Open the [Google Cloud Console](https://console.cloud.google.com/).
 2. Create a new project (e.g. `Omarchy Tasks`) or select an existing one.
 3. Enable the **Google Tasks API**:
-   - Navigate to **APIs & Services** → **Library**.
-   - Search for **Google Tasks API** and click **Enable**.
-4. Configure the **OAuth Consent Screen**:
-   - Go to **APIs & Services** → **OAuth consent screen**.
-   - Select **External** (or Internal for Workspace) and click **Create**.
-   - Fill in an App name (e.g. `Omarchy Tasks`) and your email address.
-   - Click **Save and Continue** through the steps.
-   - Under **Test users**, add your own Google email address.
-5. Create your **OAuth Client ID**:
-   - Go to **APIs & Services** → **Credentials** → **Create Credentials** → **OAuth client ID**.
-   - Application type: **Desktop app**.
+   - Navigate to **APIs & Services** → **Library** (or search for `Google Tasks API` in the top search bar).
+   - Click **Enable**.
+4. Configure the **Google Auth Platform**:
+   - In the left sidebar, navigate to **Google Auth Platform** (or **APIs & Services** → **OAuth consent screen**).
+   - **Branding tab**: Set an App name (e.g. `Omarchy Tasks`) and your email address.
+   - **Audience tab** *(Crucial Step)*:
+     - Under **User type**, ensure it is set to **External**.
+     - Under **Test users**, click **+ Add users** and enter your Google email address (`yourname@gmail.com`).
+     > **Note:** While the app is in testing status, Google requires your email to be added under **Audience → Test users**, otherwise login will be blocked.
+5. Create your **Desktop Client ID**:
+   - In the left sidebar of Google Auth Platform, click **Clients** (or go to **APIs & Services** → **Credentials**).
+   - Click **+ Create Client** (or **Create Credentials** → **OAuth client ID**).
+   - Select Application type: **Desktop app**.
    - Name: `Omarchy Tasks Desktop`.
    - Click **Create**.
 6. Copy your **Client ID** and **Client Secret**.
@@ -52,7 +54,7 @@ Because Google Tasks contains personal data, each user connects using their own 
 2. Paste your **Client ID** and **Client Secret**.
 3. Click **Sign In with Google**.
 4. A browser window will open asking you to sign in with your Google account and grant access to Google Tasks.
-5. Click **Allow**. Once the success page appears, your tasks will sync immediately!
+5. Click **Allow** (or proceed past the testing warning if shown). Once the success page appears, your tasks will sync immediately!
 
 *(Alternative: You can also place your downloaded `client_secret.json` directly inside `~/.config/omarchy/plugins/cjkaufman.google-tasks/client_secret.json`)*.
 
