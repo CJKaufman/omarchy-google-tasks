@@ -109,7 +109,8 @@ Panel {
   }
 
   function fetchLists() {
-    if (!root.authenticated || listListsProc.running) return
+    if (!root.authenticated) return
+    listListsProc.running = false
     listListsProc.inputPayload = JSON.stringify({ action: "list-lists" })
     listListsProc.running = true
   }
@@ -117,14 +118,13 @@ Panel {
   function fetchTasks() {
     if (!root.authenticated || root.activeListId === "") return
     root.scanning = true
+    listTasksProc.running = false
     listTasksProc.inputPayload = JSON.stringify({
       action: "list-tasks",
       list_id: root.activeListId,
       show_completed: root.prefShowCompleted
     })
-    if (!listTasksProc.running) {
-      listTasksProc.running = true
-    }
+    listTasksProc.running = true
   }
 
   function quickAddTask(title) {
@@ -207,8 +207,7 @@ Panel {
     if (opened) {
       checkStatus()
       if (root.authenticated) {
-        if (root.taskLists.length === 0) root.fetchLists()
-        else root.fetchTasks()
+        root.fetchLists()
       }
     }
   }
@@ -220,8 +219,8 @@ Panel {
     repeat: true
     triggeredOnStart: true
     onTriggered: {
-      if (root.authenticated && root.activeListId !== "") {
-        fetchTasks()
+      if (root.authenticated) {
+        root.fetchLists()
       } else {
         checkStatus()
       }
@@ -271,14 +270,23 @@ Panel {
             root.taskLists = arr.slice(0, 25)
             var target = null
             for (var i = 0; i < root.taskLists.length; i++) {
-              if (root.taskLists[i].title.toLowerCase() === root.prefListName.toLowerCase() || root.taskLists[i].id === root.prefListName) {
+              if (root.taskLists[i].id === root.activeListId) {
                 target = root.taskLists[i]
                 break
+              }
+            }
+            if (!target && root.prefListName) {
+              for (var j = 0; j < root.taskLists.length; j++) {
+                if (root.taskLists[j].title.toLowerCase() === root.prefListName.toLowerCase() || root.taskLists[j].id === root.prefListName) {
+                  target = root.taskLists[j]
+                  break
+                }
               }
             }
             if (!target) target = root.taskLists[0]
             root.activeListId = target.id
             root.activeListTitle = target.title
+            root.statusError = ""
             root.fetchTasks()
           }
         } catch (e) {
@@ -319,8 +327,19 @@ Panel {
           console.warn("listTasksProc error:", text)
           try {
             var err = JSON.parse(text)
-            root.statusError = String(err.error || text).substring(0, 250)
+            var errMsg = String(err.error || text)
+            if (errMsg.indexOf("404") !== -1 || errMsg.indexOf("not found") !== -1 || errMsg.indexOf("notFound") !== -1) {
+              root.activeListId = ""
+              root.fetchLists()
+              return
+            }
+            root.statusError = errMsg.substring(0, 250)
           } catch (e) {
+            if (text.indexOf("404") !== -1 || text.indexOf("not found") !== -1 || text.indexOf("notFound") !== -1) {
+              root.activeListId = ""
+              root.fetchLists()
+              return
+            }
             root.statusError = String(text).substring(0, 250)
           }
         }
@@ -554,7 +573,8 @@ Panel {
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 onClicked: {
-                  if (root.authenticated) root.fetchTasks()
+                  root.statusError = ""
+                  if (root.authenticated) root.fetchLists()
                   else root.checkStatus()
                 }
               }
