@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""
+Google Tasks CLI Helper for Omarchy Quattro
+Uses standard Python library (zero external dependencies).
+"""
+
+import sys
+import os
+import json
+import argparse
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
+import http.server
+import socketserver
+import webbrowser
+import threading
+import ssl
+
+# Define storage directories
+CONFIG_DIR = os.path.expanduser("~/.config/omarchy/plugins/cjkaufman.google-tasks")
+STATE_DIR = os.path.expanduser("~/.local/state/omarchy/cjkaufman.google-tasks")
+
+def get_data_dir():
+    # Prefer state dir or config dir
+    for d in [CONFIG_DIR, STATE_DIR]:
+        if os.path.exists(d):
+            return d
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    return CONFIG_DIR
+
+def get_token_path():
+    return os.path.join(get_data_dir(), "token.json")
+
+def get_config_path():
+    return os.path.join(get_data_dir(), "config.json")
+
+def load_config():
+    path = get_config_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    # Check for client_secret.json in config dir or script dir
+    for candidate in [
+        os.path.join(get_data_dir(), "client_secret.json"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "client_secret.json")
+    ]:
+        if os.path.exists(candidate):
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    installed = data.get("installed", data.get("web", {}))
+                    if installed:
+                        return {
+                            "client_id": installed.get("client_id", ""),
+                            "client_secret": installed.get("client_secret", "")
+                        }
+            except Exception:
+                pass
+    return {}
+
+def save_config(client_id, client_secret):
+    os.makedirs(get_data_dir(), exist_ok=True)
+    config = {"client_id": client_id.strip(), "client_secret": client_secret.strip()}
+    with open(get_config_path(), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    os.chmod(get_config_path(), 0o600)
+    return config
+
+def load_token():
+    path = get_token_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+def save_token(token_data):
+    os.makedirs(get_data_dir(), exist_ok=True)
+    path = get_token_path()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(token_data, f, indent=2)
+    os.chmod(path, 0o600)
+
+def refresh_access_token(token_data, client_id, client_secret):
+    refresh_token = token_data.get("refresh_token")
+    if not refresh_token:
+        raise ValueError("No refresh_token found in saved credentials.")
+    
+    url = "https://oauth2.googleapis.com/token"
+    payload = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token"
+    }).encode("utf-8")
+    
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req) as resp:
+        res_data = json.loads(resp.read().decode("utf-8"))
+        token_data["access_token"] = res_data["access_token"]
+        token_data["expires_at"] = time.time() + res_data.get("expires_in", 3600)
+        save_token(token_data)
+        return token_data["access_token"]
+
+def get_valid_access_token():
+    config = load_config()
+    client_id = config.get("client_id") or os.environ.get("GOOGLE_TASKS_CLIENT_ID")
+    client_secret = config.get("client_secret") or os.environ.get("GOOGLE_TASKS_CLIENT_SECRET")
+    
+    if not client_id or not client_secret:
+        raise ValueError("Google Client ID and Secret are not configured. Run auth setup first.")
+    
+    token_data = load_token()
+    if not token_data:
+        raise ValueError("Not authenticated. Please run the login/auth flow.")
+    
+    # Check if access token is still valid (buffer of 60 seconds)
+    expires_at = token_data.get("expires_at", 0)
+    if time.time() < (expires_at - 60) and token_data.get("access_token"):
+        return token_data["access_token"]
+    
+    return refresh_access_token(token_data, client_id, client_secret)
+
+def api_request(endpoint, method="GET", body=None, params=None):
+    token = get_valid_access_token()
+    url = f"https://tasks.googleapis.com/tasks/v1{endpoint}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            content = resp.read().decode("utf-8")
+            if not content:
+                return {}
+            return json.loads(content)
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode("utf-8")
+        try:
+            err_json = json.loads(err_msg)
+            raise RuntimeError(err_json.get("error", {}).get("message", err_msg))
+        except Exception:
+            raise RuntimeError(f"HTTP {e.code}: {err_msg}")
+
+class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+    auth_code = None
+    error = None
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        if "code" in params:
+            OAuthCallbackHandler.auth_code = params["code"][0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head><title>Authentication Successful</title>
+            <style>
+              body { font-family: system-ui, -apple-system, sans-serif; background: #121214; color: #e1e1e6; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+              .card { background: #202024; padding: 2rem; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); text-align: center; max-width: 400px; }
+              h1 { color: #4ade80; margin-bottom: 0.5rem; }
+              p { color: #a1a1aa; line-height: 1.5; }
+            </style>
+            </head>
+            <body>
+              <div class="card">
+                <h1>✓ Success!</h1>
+                <p>Google Tasks authentication completed successfully.</p>
+                <p>You can close this tab and return to Omarchy.</p>
+              </div>
+            </body>
+            </html>
+            """
+            self.wfile.write(html.encode("utf-8"))
+        else:
+            OAuthCallbackHandler.error = params.get("error", ["Unknown error"])[0]
+            self.send_response(400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"<h1>Authentication Failed</h1><p>Please try again.</p>")
+
+    def log_message(self, format, *args):
+        pass  # Suppress server logging to keep stdout clean
+
+def run_oauth_flow(client_id, client_secret, port=8765):
+    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    scope = "https://www.googleapis.com/auth/tasks"
+    
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth?" +
+        urllib.parse.urlencode({
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": scope,
+            "access_type": "offline",
+            "prompt": "consent"
+        })
+    )
+    
+    server = socketserver.TCPServer(("127.0.0.1", port), OAuthCallbackHandler)
+    server_thread = threading.Thread(target=server.handle_request)
+    server_thread.daemon = True
+    server_thread.start()
+    
+    webbrowser.open(auth_url)
+    
+    server_thread.join(timeout=120)
+    server.server_close()
+    
+    code = OAuthCallbackHandler.auth_code
+    if not code:
+        raise RuntimeError(f"Authentication timed out or failed: {OAuthCallbackHandler.error}")
+    
+    # Exchange code for tokens
+    url = "https://oauth2.googleapis.com/token"
+    payload = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect_uri
+    }).encode("utf-8")
+    
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req) as resp:
+        res_data = json.loads(resp.read().decode("utf-8"))
+        res_data["expires_at"] = time.time() + res_data.get("expires_in", 3600)
+        save_token(res_data)
+        save_config(client_id, client_secret)
+        return res_data
+
+def main():
+    parser = argparse.ArgumentParser(description="Google Tasks CLI Helper")
+    sub = parser.add_subparsers(dest="command")
+
+    # Status
+    sub.add_parser("status")
+
+    # Configure client
+    p_cfg = sub.add_parser("save-client")
+    p_cfg.add_argument("--client-id", required=True)
+    p_cfg.add_argument("--client-secret", required=True)
+
+    # Auth
+    p_auth = sub.add_parser("auth")
+    p_auth.add_argument("--client-id", required=False)
+    p_auth.add_argument("--client-secret", required=False)
+    p_auth.add_argument("--port", type=int, default=8765)
+
+    # Logout
+    sub.add_parser("logout")
+
+    # List Task Lists
+    sub.add_parser("list-lists")
+
+    # List Tasks
+    p_lt = sub.add_parser("list-tasks")
+    p_lt.add_argument("--list-id", required=True)
+    p_lt.add_argument("--show-completed", action="store_true")
+
+    # Create Task
+    p_ct = sub.add_parser("create-task")
+    p_ct.add_argument("--list-id", required=True)
+    p_ct.add_argument("--title", required=True)
+    p_ct.add_argument("--notes", default="")
+    p_ct.add_argument("--due", default="")
+
+    # Complete Task
+    p_cp = sub.add_parser("complete-task")
+    p_cp.add_argument("--list-id", required=True)
+    p_cp.add_argument("--task-id", required=True)
+
+    # Uncomplete Task
+    p_uc = sub.add_parser("uncomplete-task")
+    p_uc.add_argument("--list-id", required=True)
+    p_uc.add_argument("--task-id", required=True)
+
+    # Delete Task
+    p_dt = sub.add_parser("delete-task")
+    p_dt.add_argument("--list-id", required=True)
+    p_dt.add_argument("--task-id", required=True)
+
+    args = parser.parse_args()
+
+    try:
+        if args.command == "status":
+            cfg = load_config()
+            tok = load_token()
+            out = {
+                "configured": bool(cfg.get("client_id") and cfg.get("client_secret")),
+                "authenticated": bool(tok and tok.get("refresh_token")),
+                "config_dir": get_data_dir()
+            }
+            print(json.dumps(out))
+
+        elif args.command == "save-client":
+            save_config(args.client_id, args.client_secret)
+            print(json.dumps({"status": "ok", "message": "Client credentials saved"}))
+
+        elif args.command == "auth":
+            cfg = load_config()
+            client_id = args.client_id or cfg.get("client_id")
+            client_secret = args.client_secret or cfg.get("client_secret")
+            if not client_id or not client_secret:
+                print(json.dumps({"error": "Missing client_id or client_secret"}), file=sys.stderr)
+                sys.exit(1)
+            res = run_oauth_flow(client_id, client_secret, args.port)
+            print(json.dumps({"status": "ok", "authenticated": True}))
+
+        elif args.command == "logout":
+            token_path = get_token_path()
+            if os.path.exists(token_path):
+                os.remove(token_path)
+            print(json.dumps({"status": "ok", "message": "Logged out"}))
+
+        elif args.command == "list-lists":
+            res = api_request("/users/@me/lists")
+            lists = [{"id": item["id"], "title": item["title"]} for item in res.get("items", [])]
+            print(json.dumps(lists))
+
+        elif args.command == "list-tasks":
+            params = {
+                "showCompleted": "true" if args.show_completed else "false",
+                "showHidden": "false",
+                "maxResults": 100
+            }
+            res = api_request(f"/lists/{args.list_id}/tasks", params=params)
+            items = []
+            for item in res.get("items", []):
+                # Filter out deleted items
+                if item.get("deleted"):
+                    continue
+                items.append({
+                    "id": item.get("id"),
+                    "title": item.get("title", ""),
+                    "notes": item.get("notes", ""),
+                    "status": item.get("status", "needsAction"),
+                    "due": item.get("due", ""),
+                    "completed": item.get("completed", ""),
+                    "updated": item.get("updated", "")
+                })
+            print(json.dumps(items))
+
+        elif args.command == "create-task":
+            body = {"title": args.title}
+            if args.notes:
+                body["notes"] = args.notes
+            if args.due:
+                body["due"] = args.due
+            res = api_request(f"/lists/{args.list_id}/tasks", method="POST", body=body)
+            print(json.dumps({
+                "id": res.get("id"),
+                "title": res.get("title"),
+                "status": res.get("status"),
+                "due": res.get("due", "")
+            }))
+
+        elif args.command == "complete-task":
+            body = {"id": args.task_id, "status": "completed"}
+            res = api_request(f"/lists/{args.list_id}/tasks/{args.task_id}", method="PATCH", body=body)
+            print(json.dumps({"status": "ok", "id": args.task_id}))
+
+        elif args.command == "uncomplete-task":
+            body = {"id": args.task_id, "status": "needsAction", "completed": None}
+            res = api_request(f"/lists/{args.list_id}/tasks/{args.task_id}", method="PATCH", body=body)
+            print(json.dumps({"status": "ok", "id": args.task_id}))
+
+        elif args.command == "delete-task":
+            api_request(f"/lists/{args.list_id}/tasks/{args.task_id}", method="DELETE")
+            print(json.dumps({"status": "ok", "deleted": args.task_id}))
+
+        else:
+            parser.print_help()
+            sys.exit(1)
+
+    except Exception as e:
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

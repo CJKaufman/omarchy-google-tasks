@@ -1,0 +1,21 @@
+# Credentials and tokens (NEVER commit)
+credentials.json
+client_secret.json
+token.json
+*.token
+.env
+.env.*
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# OS and editor files
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

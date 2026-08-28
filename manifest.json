@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "id": "cjkaufman.google-tasks",
+  "name": "Google Tasks",
+  "version": "1.0.0",
+  "author": "Carl Kaufman",
+  "license": "MIT",
+  "description": "View, manage, and quick-add Google Tasks reminders from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Google Tasks",
+    "description": "Synced Google Tasks & reminders popup with quick-add, interactive completion checkboxes, due-date highlighting, and multi-list support.",
+    "category": "Productivity",
+    "aliases": ["tasks", "google", "reminders", "todo", "gkeep"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "targetListId": "",
+      "targetListName": "My Tasks",
+      "refreshIntervalSec": 120,
+      "showCompleted": false,
+      "countMode": "all"
+    },
+    "schema": [
+      {
+        "key": "targetListName",
+        "type": "string",
+        "label": "Task List Name",
+        "defaultValue": "My Tasks",
+        "description": "The name or ID of the Google Tasks list to sync (e.g. 'Reminders', 'Work', 'My Tasks')."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Sync Interval (seconds)",
+        "min": 30,
+        "max": 1800,
+        "step": 30,
+        "defaultValue": 120,
+        "description": "How often tasks are fetched in the background."
+      },
+      {
+        "key": "showCompleted",
+        "type": "boolean",
+        "label": "Show completed tasks",
+        "defaultValue": false,
+        "description": "Show recently completed tasks at the bottom of the list."
+      },
+      {
+        "key": "countMode",
+        "type": "enum",
+        "label": "Bar badge counts",
+        "options": [
+          "all",
+          "due",
+          "none"
+        ],
+        "defaultValue": "all",
+        "description": "'all' counts all open tasks; 'due' counts only tasks due today or overdue; 'none' hides the badge."
+      }
+    ]
+  }
+}
