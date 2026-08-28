@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Google Tasks CLI Helper for Omarchy Quattro
-Uses standard Python library (zero external dependencies).
+Google Tasks Helper for Omarchy Quattro
+Communicates via structured bounded JSON over stdin.
+Zero external dependencies (pure Python standard library).
 """
 
 import sys
@@ -16,14 +17,20 @@ import http.server
 import socketserver
 import webbrowser
 import threading
-import ssl
 
-# Define storage directories
+MAX_STDIN_BYTES = 65536
+MAX_TASK_LISTS = 25
+MAX_TASKS = 50
+MAX_TITLE_LEN = 300
+MAX_NOTES_LEN = 1000
+MAX_LIST_TITLE_LEN = 100
+MAX_ERROR_LEN = 250
+
+# Storage directories
 CONFIG_DIR = os.path.expanduser("~/.config/omarchy/plugins/cjkaufman.google-tasks")
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy/cjkaufman.google-tasks")
 
 def get_data_dir():
-    # Prefer state dir or config dir
     for d in [CONFIG_DIR, STATE_DIR]:
         if os.path.exists(d):
             return d
@@ -44,7 +51,6 @@ def load_config():
                 return json.load(f)
         except Exception:
             pass
-    # Check for client_secret.json in config dir or script dir
     for candidate in [
         os.path.join(get_data_dir(), "client_secret.json"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "client_secret.json")
@@ -65,7 +71,7 @@ def load_config():
 
 def save_config(client_id, client_secret):
     os.makedirs(get_data_dir(), exist_ok=True)
-    config = {"client_id": client_id.strip(), "client_secret": client_secret.strip()}
+    config = {"client_id": str(client_id).strip(), "client_secret": str(client_secret).strip()}
     with open(get_config_path(), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
     os.chmod(get_config_path(), 0o600)
@@ -121,7 +127,6 @@ def get_valid_access_token():
     if not token_data:
         raise ValueError("Not authenticated. Please run the login/auth flow.")
     
-    # Check if access token is still valid (buffer of 60 seconds)
     expires_at = token_data.get("expires_at", 0)
     if time.time() < (expires_at - 60) and token_data.get("access_token"):
         return token_data["access_token"]
@@ -151,9 +156,10 @@ def api_request(endpoint, method="GET", body=None, params=None):
         err_msg = e.read().decode("utf-8")
         try:
             err_json = json.loads(err_msg)
-            raise RuntimeError(err_json.get("error", {}).get("message", err_msg))
+            msg = err_json.get("error", {}).get("message", err_msg)
+            raise RuntimeError(msg[:MAX_ERROR_LEN])
         except Exception:
-            raise RuntimeError(f"HTTP {e.code}: {err_msg}")
+            raise RuntimeError(f"HTTP {e.code}: {err_msg}"[:MAX_ERROR_LEN])
 
 class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     auth_code = None
@@ -196,7 +202,7 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"<h1>Authentication Failed</h1><p>Please try again.</p>")
 
     def log_message(self, format, *args):
-        pass  # Suppress server logging to keep stdout clean
+        pass
 
 def run_oauth_flow(client_id, client_secret, port=8765):
     redirect_uri = f"http://127.0.0.1:{port}/callback"
@@ -226,9 +232,8 @@ def run_oauth_flow(client_id, client_secret, port=8765):
     
     code = OAuthCallbackHandler.auth_code
     if not code:
-        raise RuntimeError(f"Authentication timed out or failed: {OAuthCallbackHandler.error}")
+        raise RuntimeError(f"Authentication timed out or failed: {OAuthCallbackHandler.error}"[:MAX_ERROR_LEN])
     
-    # Exchange code for tokens
     url = "https://oauth2.googleapis.com/token"
     payload = urllib.parse.urlencode({
         "client_id": client_id,
@@ -246,152 +251,143 @@ def run_oauth_flow(client_id, client_secret, port=8765):
         save_config(client_id, client_secret)
         return res_data
 
+def handle_action(req):
+    action = req.get("action", "")
+
+    if action == "status":
+        cfg = load_config()
+        tok = load_token()
+        return {
+            "configured": bool(cfg.get("client_id") and cfg.get("client_secret")),
+            "authenticated": bool(tok and tok.get("refresh_token")),
+            "config_dir": get_data_dir()
+        }
+
+    elif action == "auth":
+        cfg = load_config()
+        client_id = req.get("client_id") or cfg.get("client_id")
+        client_secret = req.get("client_secret") or cfg.get("client_secret")
+        port = int(req.get("port", 8765))
+        if not client_id or not client_secret:
+            raise ValueError("Missing client_id or client_secret")
+        run_oauth_flow(str(client_id).strip(), str(client_secret).strip(), port)
+        return {"status": "ok", "authenticated": True}
+
+    elif action == "logout":
+        token_path = get_token_path()
+        if os.path.exists(token_path):
+            os.remove(token_path)
+        return {"status": "ok", "message": "Logged out"}
+
+    elif action == "list-lists":
+        res = api_request("/users/@me/lists", params={"maxResults": str(MAX_TASK_LISTS)})
+        lists = []
+        for item in res.get("items", [])[:MAX_TASK_LISTS]:
+            lists.append({
+                "id": str(item.get("id", ""))[:100],
+                "title": str(item.get("title", ""))[:MAX_LIST_TITLE_LEN]
+            })
+        return lists
+
+    elif action == "list-tasks":
+        list_id = str(req.get("list_id", "")).strip()
+        if not list_id:
+            raise ValueError("Missing list_id")
+        show_completed = bool(req.get("show_completed", False))
+        params = {
+            "showCompleted": "true" if show_completed else "false",
+            "showHidden": "false",
+            "maxResults": str(MAX_TASKS)
+        }
+        res = api_request(f"/lists/{list_id}/tasks", params=params)
+        items = []
+        for item in res.get("items", [])[:MAX_TASKS]:
+            if item.get("deleted"):
+                continue
+            items.append({
+                "id": str(item.get("id", ""))[:100],
+                "title": str(item.get("title", ""))[:MAX_TITLE_LEN],
+                "notes": str(item.get("notes", ""))[:MAX_NOTES_LEN],
+                "status": "completed" if item.get("status") == "completed" else "needsAction",
+                "due": str(item.get("due", ""))[:50],
+                "completed": str(item.get("completed", ""))[:50],
+                "updated": str(item.get("updated", ""))[:50]
+            })
+        return items
+
+    elif action == "create-task":
+        list_id = str(req.get("list_id", "")).strip()
+        title = str(req.get("title", "")).strip()[:MAX_TITLE_LEN]
+        if not list_id or not title:
+            raise ValueError("Missing list_id or title")
+        body = {"title": title}
+        if req.get("notes"):
+            body["notes"] = str(req.get("notes"))[:MAX_NOTES_LEN]
+        if req.get("due"):
+            body["due"] = str(req.get("due"))[:50]
+        res = api_request(f"/lists/{list_id}/tasks", method="POST", body=body)
+        return {
+            "id": str(res.get("id", ""))[:100],
+            "title": str(res.get("title", ""))[:MAX_TITLE_LEN],
+            "status": str(res.get("status", "needsAction")),
+            "due": str(res.get("due", ""))[:50]
+        }
+
+    elif action == "complete-task":
+        list_id = str(req.get("list_id", "")).strip()
+        task_id = str(req.get("task_id", "")).strip()
+        if not list_id or not task_id:
+            raise ValueError("Missing list_id or task_id")
+        body = {"id": task_id, "status": "completed"}
+        api_request(f"/lists/{list_id}/tasks/{task_id}", method="PATCH", body=body)
+        return {"status": "ok", "id": task_id}
+
+    elif action == "uncomplete-task":
+        list_id = str(req.get("list_id", "")).strip()
+        task_id = str(req.get("task_id", "")).strip()
+        if not list_id or not task_id:
+            raise ValueError("Missing list_id or task_id")
+        body = {"id": task_id, "status": "needsAction", "completed": None}
+        api_request(f"/lists/{list_id}/tasks/{task_id}", method="PATCH", body=body)
+        return {"status": "ok", "id": task_id}
+
+    elif action == "delete-task":
+        list_id = str(req.get("list_id", "")).strip()
+        task_id = str(req.get("task_id", "")).strip()
+        if not list_id or not task_id:
+            raise ValueError("Missing list_id or task_id")
+        api_request(f"/lists/{list_id}/tasks/{task_id}", method="DELETE")
+        return {"status": "ok", "deleted": task_id}
+
+    else:
+        raise ValueError(f"Unknown action: {action}")
+
 def main():
-    parser = argparse.ArgumentParser(description="Google Tasks CLI Helper")
-    sub = parser.add_subparsers(dest="command")
+    # Read bounded payload from stdin if available, or parse action argument
+    if len(sys.argv) > 1 and sys.argv[1] == "status":
+        # Fast status check without stdin requirement
+        cfg = load_config()
+        tok = load_token()
+        out = {
+            "configured": bool(cfg.get("client_id") and cfg.get("client_secret")),
+            "authenticated": bool(tok and tok.get("refresh_token")),
+            "config_dir": get_data_dir()
+        }
+        print(json.dumps(out))
+        return
 
-    # Status
-    sub.add_parser("status")
-
-    # Configure client
-    p_cfg = sub.add_parser("save-client")
-    p_cfg.add_argument("--client-id", required=True)
-    p_cfg.add_argument("--client-secret", required=True)
-
-    # Auth
-    p_auth = sub.add_parser("auth")
-    p_auth.add_argument("--client-id", required=False)
-    p_auth.add_argument("--client-secret", required=False)
-    p_auth.add_argument("--port", type=int, default=8765)
-
-    # Logout
-    sub.add_parser("logout")
-
-    # List Task Lists
-    sub.add_parser("list-lists")
-
-    # List Tasks
-    p_lt = sub.add_parser("list-tasks")
-    p_lt.add_argument("--list-id", required=True)
-    p_lt.add_argument("--show-completed", action="store_true")
-
-    # Create Task
-    p_ct = sub.add_parser("create-task")
-    p_ct.add_argument("--list-id", required=True)
-    p_ct.add_argument("--title", required=True)
-    p_ct.add_argument("--notes", default="")
-    p_ct.add_argument("--due", default="")
-
-    # Complete Task
-    p_cp = sub.add_parser("complete-task")
-    p_cp.add_argument("--list-id", required=True)
-    p_cp.add_argument("--task-id", required=True)
-
-    # Uncomplete Task
-    p_uc = sub.add_parser("uncomplete-task")
-    p_uc.add_argument("--list-id", required=True)
-    p_uc.add_argument("--task-id", required=True)
-
-    # Delete Task
-    p_dt = sub.add_parser("delete-task")
-    p_dt.add_argument("--list-id", required=True)
-    p_dt.add_argument("--task-id", required=True)
-
-    args = parser.parse_args()
+    raw_input = sys.stdin.read(MAX_STDIN_BYTES)
+    if not raw_input or not raw_input.strip():
+        print(json.dumps({"error": "Empty stdin payload"}), file=sys.stderr)
+        sys.exit(1)
 
     try:
-        if args.command == "status":
-            cfg = load_config()
-            tok = load_token()
-            out = {
-                "configured": bool(cfg.get("client_id") and cfg.get("client_secret")),
-                "authenticated": bool(tok and tok.get("refresh_token")),
-                "config_dir": get_data_dir()
-            }
-            print(json.dumps(out))
-
-        elif args.command == "save-client":
-            save_config(args.client_id, args.client_secret)
-            print(json.dumps({"status": "ok", "message": "Client credentials saved"}))
-
-        elif args.command == "auth":
-            cfg = load_config()
-            client_id = args.client_id or cfg.get("client_id")
-            client_secret = args.client_secret or cfg.get("client_secret")
-            if not client_id or not client_secret:
-                print(json.dumps({"error": "Missing client_id or client_secret"}), file=sys.stderr)
-                sys.exit(1)
-            res = run_oauth_flow(client_id, client_secret, args.port)
-            print(json.dumps({"status": "ok", "authenticated": True}))
-
-        elif args.command == "logout":
-            token_path = get_token_path()
-            if os.path.exists(token_path):
-                os.remove(token_path)
-            print(json.dumps({"status": "ok", "message": "Logged out"}))
-
-        elif args.command == "list-lists":
-            res = api_request("/users/@me/lists")
-            lists = [{"id": item["id"], "title": item["title"]} for item in res.get("items", [])]
-            print(json.dumps(lists))
-
-        elif args.command == "list-tasks":
-            params = {
-                "showCompleted": "true" if args.show_completed else "false",
-                "showHidden": "false",
-                "maxResults": 100
-            }
-            res = api_request(f"/lists/{args.list_id}/tasks", params=params)
-            items = []
-            for item in res.get("items", []):
-                # Filter out deleted items
-                if item.get("deleted"):
-                    continue
-                items.append({
-                    "id": item.get("id"),
-                    "title": item.get("title", ""),
-                    "notes": item.get("notes", ""),
-                    "status": item.get("status", "needsAction"),
-                    "due": item.get("due", ""),
-                    "completed": item.get("completed", ""),
-                    "updated": item.get("updated", "")
-                })
-            print(json.dumps(items))
-
-        elif args.command == "create-task":
-            body = {"title": args.title}
-            if args.notes:
-                body["notes"] = args.notes
-            if args.due:
-                body["due"] = args.due
-            res = api_request(f"/lists/{args.list_id}/tasks", method="POST", body=body)
-            print(json.dumps({
-                "id": res.get("id"),
-                "title": res.get("title"),
-                "status": res.get("status"),
-                "due": res.get("due", "")
-            }))
-
-        elif args.command == "complete-task":
-            body = {"id": args.task_id, "status": "completed"}
-            res = api_request(f"/lists/{args.list_id}/tasks/{args.task_id}", method="PATCH", body=body)
-            print(json.dumps({"status": "ok", "id": args.task_id}))
-
-        elif args.command == "uncomplete-task":
-            body = {"id": args.task_id, "status": "needsAction", "completed": None}
-            res = api_request(f"/lists/{args.list_id}/tasks/{args.task_id}", method="PATCH", body=body)
-            print(json.dumps({"status": "ok", "id": args.task_id}))
-
-        elif args.command == "delete-task":
-            api_request(f"/lists/{args.list_id}/tasks/{args.task_id}", method="DELETE")
-            print(json.dumps({"status": "ok", "deleted": args.task_id}))
-
-        else:
-            parser.print_help()
-            sys.exit(1)
-
+        req = json.loads(raw_input)
+        result = handle_action(req)
+        print(json.dumps(result))
     except Exception as e:
-        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        err_msg = str(e)[:MAX_ERROR_LEN]
+        print(json.dumps({"error": err_msg}), file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":

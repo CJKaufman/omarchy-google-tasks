@@ -63,7 +63,7 @@ Panel {
 
   readonly property var dueTasks: openTasks.filter(function (t) {
     if (!t.due || t.due === "") return false
-    var d = t.due.substring(0, 10)
+    var d = String(t.due).substring(0, 10)
     return d <= root.todayStr
   })
 
@@ -83,7 +83,7 @@ Panel {
 
   function formatDue(due) {
     if (!due || due === "") return ""
-    var d = due.substring(0, 10)
+    var d = String(due).substring(0, 10)
     if (d < root.todayStr) return "Overdue"
     if (d === root.todayStr) return "Today"
     var tomorrow = new Date()
@@ -94,45 +94,45 @@ Panel {
 
   function isOverdue(due) {
     if (!due || due === "") return false
-    return due.substring(0, 10) < root.todayStr
+    return String(due).substring(0, 10) < root.todayStr
   }
 
   function isDueToday(due) {
     if (!due || due === "") return false
-    return due.substring(0, 10) === root.todayStr
+    return String(due).substring(0, 10) === root.todayStr
   }
 
-  // API Process triggers
+  // API Process triggers using stdin bounded IPC
   function checkStatus() {
+    statusProc.inputPayload = JSON.stringify({ action: "status" })
     statusProc.running = true
   }
 
   function fetchLists() {
-    if (!root.authenticated) return
+    if (!root.authenticated || listListsProc.running) return
+    listListsProc.inputPayload = JSON.stringify({ action: "list-lists" })
     listListsProc.running = true
   }
 
   function fetchTasks() {
     if (!root.authenticated || root.activeListId === "" || listTasksProc.running) return
     root.scanning = true
-    listTasksProc.command = [
-      root.helper, "list-tasks",
-      "--list-id", root.activeListId
-    ]
-    if (root.prefShowCompleted) {
-      listTasksProc.command.push("--show-completed")
-    }
+    listTasksProc.inputPayload = JSON.stringify({
+      action: "list-tasks",
+      list_id: root.activeListId,
+      show_completed: root.prefShowCompleted
+    })
     listTasksProc.running = true
   }
 
   function quickAddTask(title) {
     var clean = String(title || "").trim()
-    if (clean === "" || !root.authenticated || root.activeListId === "") return
-    createTaskProc.command = [
-      root.helper, "create-task",
-      "--list-id", root.activeListId,
-      "--title", clean
-    ]
+    if (clean === "" || !root.authenticated || root.activeListId === "" || createTaskProc.running) return
+    createTaskProc.inputPayload = JSON.stringify({
+      action: "create-task",
+      list_id: root.activeListId,
+      title: clean
+    })
     createTaskProc.running = true
   }
 
@@ -142,42 +142,42 @@ Panel {
     if (task.status === "needsAction") {
       updated[task.id] = true
       root.optimisticallyCompleted = updated
-      completeTaskProc.command = [
-        root.helper, "complete-task",
-        "--list-id", root.activeListId,
-        "--task-id", task.id
-      ]
+      completeTaskProc.inputPayload = JSON.stringify({
+        action: "complete-task",
+        list_id: root.activeListId,
+        task_id: task.id
+      })
       completeTaskProc.running = true
     } else {
       delete updated[task.id]
       root.optimisticallyCompleted = updated
-      uncompleteTaskProc.command = [
-        root.helper, "uncomplete-task",
-        "--list-id", root.activeListId,
-        "--task-id", task.id
-      ]
+      uncompleteTaskProc.inputPayload = JSON.stringify({
+        action: "uncomplete-task",
+        list_id: root.activeListId,
+        task_id: task.id
+      })
       uncompleteTaskProc.running = true
     }
   }
 
   function deleteTask(task) {
-    if (!task || !task.id || !root.authenticated) return
-    deleteTaskProc.command = [
-      root.helper, "delete-task",
-      "--list-id", root.activeListId,
-      "--task-id", task.id
-    ]
+    if (!task || !task.id || !root.authenticated || deleteTaskProc.running) return
+    deleteTaskProc.inputPayload = JSON.stringify({
+      action: "delete-task",
+      list_id: root.activeListId,
+      task_id: task.id
+    })
     deleteTaskProc.running = true
   }
 
   function startAuthFlow(clientId, clientSecret) {
     root.authPending = true
     root.statusError = ""
-    authProc.command = [
-      root.helper, "auth",
-      "--client-id", String(clientId || "").trim(),
-      "--client-secret", String(clientSecret || "").trim()
-    ]
+    authProc.inputPayload = JSON.stringify({
+      action: "auth",
+      client_id: String(clientId || "").trim(),
+      client_secret: String(clientSecret || "").trim()
+    })
     authProc.running = true
   }
 
@@ -205,10 +205,15 @@ Panel {
     }
   }
 
-  // Process Handlers
+  // Process Handlers (All pass sensitive and private content over stdin)
   Process {
     id: statusProc
-    command: [root.helper, "status"]
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -228,23 +233,27 @@ Panel {
 
   Process {
     id: listListsProc
-    command: [root.helper, "list-lists"]
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         try {
           var arr = JSON.parse(String(text || "[]"))
           if (Array.isArray(arr) && arr.length > 0) {
-            root.taskLists = arr
-            // Select preferred list or first list
+            root.taskLists = arr.slice(0, 25)
             var target = null
-            for (var i = 0; i < arr.length; i++) {
-              if (arr[i].title.toLowerCase() === root.prefListName.toLowerCase() || arr[i].id === root.prefListName) {
-                target = arr[i]
+            for (var i = 0; i < root.taskLists.length; i++) {
+              if (root.taskLists[i].title.toLowerCase() === root.prefListName.toLowerCase() || root.taskLists[i].id === root.prefListName) {
+                target = root.taskLists[i]
                 break
               }
             }
-            if (!target) target = arr[0]
+            if (!target) target = root.taskLists[0]
             root.activeListId = target.id
             root.activeListTitle = target.title
             root.fetchTasks()
@@ -258,6 +267,12 @@ Panel {
 
   Process {
     id: listTasksProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -265,7 +280,7 @@ Panel {
         try {
           var items = JSON.parse(String(text || "[]"))
           if (Array.isArray(items)) {
-            root.tasks = items
+            root.tasks = items.slice(0, 50)
             root.optimisticallyCompleted = ({})
           }
         } catch (e) {
@@ -277,6 +292,12 @@ Panel {
 
   Process {
     id: createTaskProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.fetchTasks()
@@ -285,6 +306,12 @@ Panel {
 
   Process {
     id: completeTaskProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.fetchTasks()
@@ -293,6 +320,12 @@ Panel {
 
   Process {
     id: uncompleteTaskProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.fetchTasks()
@@ -301,6 +334,12 @@ Panel {
 
   Process {
     id: deleteTaskProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.fetchTasks()
@@ -309,6 +348,12 @@ Panel {
 
   Process {
     id: authProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -323,9 +368,9 @@ Panel {
           root.authPending = false
           try {
             var err = JSON.parse(text)
-            root.statusError = err.error || text
+            root.statusError = String(err.error || text).substring(0, 250)
           } catch(e) {
-            root.statusError = text
+            root.statusError = String(text).substring(0, 250)
           }
         }
       }
@@ -403,6 +448,7 @@ Panel {
 
               Text {
                 text: root.glyphBar
+                textFormat: Text.PlainText
                 color: root.accent
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.display
@@ -415,6 +461,7 @@ Panel {
 
                 Text {
                   text: root.activeListTitle
+                  textFormat: Text.PlainText
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.heading
@@ -423,6 +470,7 @@ Panel {
 
                 Text {
                   text: root.summary
+                  textFormat: Text.PlainText
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -476,6 +524,7 @@ Panel {
 
               Text {
                 text: root.authenticated ? "Google Account Connected" : "Connect Google Tasks"
+                textFormat: Text.PlainText
                 color: root.authenticated ? root.accent : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -487,6 +536,7 @@ Panel {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 text: "Provide your Google Cloud Desktop Client credentials to sign in. See README for 2-minute setup guide."
+                textFormat: Text.PlainText
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -539,6 +589,7 @@ Panel {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 text: root.statusError
+                textFormat: Text.PlainText
                 color: root.urgent
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -552,6 +603,7 @@ Panel {
 
                 Text {
                   text: "Switch Task List:"
+                  textFormat: Text.PlainText
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -572,7 +624,8 @@ Panel {
                       Text {
                         id: listLabel
                         anchors.centerIn: parent
-                        text: modelData.title
+                        text: String(modelData.title || "")
+                        textFormat: Text.PlainText
                         color: root.activeListId === modelData.id ? "#ffffff" : root.foreground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
@@ -612,6 +665,7 @@ Panel {
 
               Text {
                 text: root.glyphAdd
+                textFormat: Text.PlainText
                 color: root.accent
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -667,6 +721,7 @@ Panel {
                     Text {
                       anchors.centerIn: parent
                       text: modelData.status === "completed" || root.optimisticallyCompleted[modelData.id] ? root.glyphChecked : root.glyphUnchecked
+                      textFormat: Text.PlainText
                       color: modelData.status === "completed" || root.optimisticallyCompleted[modelData.id] ? root.accent : root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
@@ -680,7 +735,8 @@ Panel {
 
                     Text {
                       Layout.fillWidth: true
-                      text: modelData.title
+                      text: String(modelData.title || "")
+                      textFormat: Text.PlainText
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
@@ -689,9 +745,10 @@ Panel {
                     }
 
                     Text {
-                      visible: modelData.notes && modelData.notes.trim() !== ""
+                      visible: modelData.notes && String(modelData.notes).trim() !== ""
                       Layout.fillWidth: true
-                      text: modelData.notes
+                      text: String(modelData.notes || "")
+                      textFormat: Text.PlainText
                       color: root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -702,7 +759,7 @@ Panel {
 
                   // Due Badge
                   Rectangle {
-                    visible: modelData.due && modelData.due !== ""
+                    visible: modelData.due && String(modelData.due) !== ""
                     implicitWidth: dueText.implicitWidth + Style.space(10)
                     implicitHeight: Style.space(20)
                     radius: Style.radius(10)
@@ -712,6 +769,7 @@ Panel {
                       id: dueText
                       anchors.centerIn: parent
                       text: root.formatDue(modelData.due)
+                      textFormat: Text.PlainText
                       color: (root.isOverdue(modelData.due) || root.isDueToday(modelData.due)) ? "#ffffff" : root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -731,6 +789,7 @@ Panel {
                     Text {
                       anchors.centerIn: parent
                       text: root.glyphTrash
+                      textFormat: Text.PlainText
                       color: root.dim
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.caption
@@ -753,6 +812,7 @@ Panel {
                 Text {
                   anchors.horizontalCenter: parent.horizontalCenter
                   text: "🎉 All tasks completed!"
+                  textFormat: Text.PlainText
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -761,6 +821,7 @@ Panel {
                 Text {
                   anchors.horizontalCenter: parent.horizontalCenter
                   text: "Type above to add a new task or reminder."
+                  textFormat: Text.PlainText
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
