@@ -376,7 +376,8 @@ def main():
         print(json.dumps(out))
         return
 
-    raw_input = sys.stdin.read(MAX_STDIN_BYTES)
+    # Read single line JSON from stdin (bounded to MAX_STDIN_BYTES)
+    raw_input = sys.stdin.readline(MAX_STDIN_BYTES)
     if not raw_input or not raw_input.strip():
         print(json.dumps({"error": "Empty stdin payload"}), file=sys.stderr)
         sys.exit(1)

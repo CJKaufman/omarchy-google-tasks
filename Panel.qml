@@ -115,19 +115,30 @@ Panel {
   }
 
   function fetchTasks() {
-    if (!root.authenticated || root.activeListId === "" || listTasksProc.running) return
+    if (!root.authenticated || root.activeListId === "") return
     root.scanning = true
     listTasksProc.inputPayload = JSON.stringify({
       action: "list-tasks",
       list_id: root.activeListId,
       show_completed: root.prefShowCompleted
     })
-    listTasksProc.running = true
+    if (!listTasksProc.running) {
+      listTasksProc.running = true
+    }
   }
 
   function quickAddTask(title) {
     var clean = String(title || "").trim()
     if (clean === "" || !root.authenticated || root.activeListId === "" || createTaskProc.running) return
+    // Optimistic UI addition
+    var tempTask = {
+      id: "temp_" + Date.now(),
+      title: clean,
+      notes: "",
+      status: "needsAction",
+      due: ""
+    }
+    root.tasks = [tempTask].concat(root.tasks || [])
     createTaskProc.inputPayload = JSON.stringify({
       action: "create-task",
       list_id: root.activeListId,
@@ -162,6 +173,8 @@ Panel {
 
   function deleteTask(task) {
     if (!task || !task.id || !root.authenticated || deleteTaskProc.running) return
+    // Optimistically remove from local tasks array
+    root.tasks = (root.tasks || []).filter(function(t) { return t.id !== task.id })
     deleteTaskProc.inputPayload = JSON.stringify({
       action: "delete-task",
       list_id: root.activeListId,
@@ -298,10 +311,7 @@ Panel {
     onStarted: {
       if (inputPayload) write(inputPayload + "\n")
     }
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.fetchTasks()
-    }
+    onExited: root.fetchTasks()
   }
 
   Process {
@@ -312,10 +322,7 @@ Panel {
     onStarted: {
       if (inputPayload) write(inputPayload + "\n")
     }
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.fetchTasks()
-    }
+    onExited: root.fetchTasks()
   }
 
   Process {
@@ -326,10 +333,7 @@ Panel {
     onStarted: {
       if (inputPayload) write(inputPayload + "\n")
     }
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.fetchTasks()
-    }
+    onExited: root.fetchTasks()
   }
 
   Process {
@@ -340,10 +344,7 @@ Panel {
     onStarted: {
       if (inputPayload) write(inputPayload + "\n")
     }
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.fetchTasks()
-    }
+    onExited: root.fetchTasks()
   }
 
   Process {
