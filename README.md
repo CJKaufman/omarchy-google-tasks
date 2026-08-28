@@ -7,6 +7,12 @@ A lightweight, keyboard-friendly **Google Tasks & Reminders** bar widget and pan
 
 View your task lists, toggle checkboxes to complete tasks in real-time, see overdue/today indicators, and quick-add new reminders directly from the Omarchy top bar.
 
+<p align="center">
+  <img src="preview.png" alt="Google Tasks Panel Preview" width="540" />
+  <br />
+  <em>Interactive Tasks Panel &amp; Bar Widget Indicator</em>
+</p>
+
 ---
 
 ## ✨ Features
