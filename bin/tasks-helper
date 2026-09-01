@@ -36,36 +36,70 @@ MAX_ERROR_LEN = 250
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
 FILE_READ_FLAGS = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
 
-# Storage directories
-CONFIG_DIR = os.path.expanduser("~/.config/omarchy/plugins/cjkaufman.google-tasks")
+# Storage directories (prefers user-owned non-symlinked state dir)
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy/cjkaufman.google-tasks")
+CONFIG_DIR = os.path.expanduser("~/.config/omarchy/cjkaufman.google-tasks")
 
 
-def get_data_dir():
-    """Return verified private storage directory, creating with 0o700 if missing."""
-    for d in [CONFIG_DIR, STATE_DIR]:
-        if os.path.isdir(d):
-            return d
-    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
-    return CONFIG_DIR
+def validate_directory(st, label, is_final=False):
+    """Ensure directory descriptor is a directory, not group/world writable, and owned properly."""
+    uid = os.getuid()
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(errno.ENOTDIR, f"Not a directory: {label}")
+    if st.st_uid not in (0, uid):
+        raise OSError(errno.EACCES, f"Unexpected owner for {label}: uid={st.st_uid}")
+    if is_final and st.st_uid != uid:
+        raise OSError(errno.EACCES, f"Final directory not owned by current user: {label}")
+    if (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)) and not (st.st_uid == 0 and bool(st.st_mode & stat.S_ISVTX)):
+        raise OSError(errno.EACCES, f"Directory is group/world writable: {label}")
 
 
 def open_dir_safe(path, create=False):
-    """Open directory descriptor verifying ownership and directory type."""
-    real_path = os.path.realpath(path)
-    if create:
-        os.makedirs(real_path, mode=0o700, exist_ok=True)
-    dir_fd = os.open(real_path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    """Walk and open directory descriptor component-by-component with strict O_NOFOLLOW."""
+    components = [p for p in os.path.normpath(path).split("/") if p]
+    current = os.open("/", DIR_FLAGS)
+    label = ""
     try:
-        st = os.fstat(dir_fd)
-        if not stat.S_ISDIR(st.st_mode):
-            raise OSError(errno.ENOTDIR, f"Not a directory: {path}")
-        if st.st_uid != os.getuid():
-            raise OSError(errno.EACCES, f"Directory not owned by user: {path}")
-        return dir_fd
+        validate_directory(os.fstat(current), "/")
+        for i, comp in enumerate(components):
+            label += "/" + comp
+            is_final = (i == len(components) - 1)
+            try:
+                following = os.open(comp, DIR_FLAGS, dir_fd=current)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                validate_directory(os.fstat(current), os.path.dirname(label), is_final=False)
+                os.mkdir(comp, 0o700, dir_fd=current)
+                following = os.open(comp, DIR_FLAGS, dir_fd=current)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise OSError(errno.ELOOP, f"Refusing symlink or non-directory at {label}") from exc
+                raise
+            os.close(current)
+            current = following
+            validate_directory(os.fstat(current), label, is_final=is_final)
+        return current
     except Exception:
-        os.close(dir_fd)
+        os.close(current)
         raise
+
+
+def get_data_dir():
+    """Return verified private storage directory refusing symlinked directory components."""
+    for d in [STATE_DIR, CONFIG_DIR]:
+        try:
+            fd = open_dir_safe(d, create=False)
+            os.close(fd)
+            return d
+        except Exception:
+            continue
+    try:
+        fd = open_dir_safe(STATE_DIR, create=True)
+        os.close(fd)
+        return STATE_DIR
+    except Exception:
+        return STATE_DIR
 
 
 def safe_read_file(dir_fd, filename, max_bytes=MAX_FILE_BYTES):
@@ -104,9 +138,7 @@ def safe_read_file(dir_fd, filename, max_bytes=MAX_FILE_BYTES):
 
 
 def safe_read_json(dir_path, filename):
-    """Safely read and parse JSON file from a directory."""
-    if not os.path.exists(dir_path):
-        return None
+    """Safely read and parse JSON file from a directory with descriptor traversal."""
     try:
         dir_fd = open_dir_safe(dir_path, create=False)
     except Exception:
@@ -168,8 +200,6 @@ def safe_write_json(dir_path, filename, obj):
 
 def safe_remove_file(dir_path, filename):
     """Safely remove a file relative to a verified directory descriptor."""
-    if not os.path.exists(dir_path):
-        return
     try:
         dir_fd = open_dir_safe(dir_path, create=False)
     except Exception:
@@ -186,15 +216,14 @@ def load_config():
     cfg = safe_read_json(get_data_dir(), "config.json")
     if cfg and isinstance(cfg, dict) and cfg.get("client_id") and cfg.get("client_secret"):
         return cfg
-    for candidate_dir in [get_data_dir(), os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")]:
-        data = safe_read_json(candidate_dir, "client_secret.json")
-        if data and isinstance(data, dict):
-            installed = data.get("installed", data.get("web", {}))
-            if installed and isinstance(installed, dict):
-                return {
-                    "client_id": str(installed.get("client_id", "")).strip(),
-                    "client_secret": str(installed.get("client_secret", "")).strip()
-                }
+    data = safe_read_json(get_data_dir(), "client_secret.json")
+    if data and isinstance(data, dict):
+        installed = data.get("installed", data.get("web", {}))
+        if installed and isinstance(installed, dict):
+            return {
+                "client_id": str(installed.get("client_id", "")).strip(),
+                "client_secret": str(installed.get("client_secret", "")).strip()
+            }
     return {}
 
 
