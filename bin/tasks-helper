@@ -7,8 +7,10 @@ Zero external dependencies (pure Python standard library).
 
 import sys
 import os
+import stat
+import errno
+import secrets
 import json
-import argparse
 import time
 import urllib.request
 import urllib.parse
@@ -19,6 +21,11 @@ import webbrowser
 import threading
 
 MAX_STDIN_BYTES = 65536
+MAX_FILE_BYTES = 65536
+MAX_RESPONSE_BYTES = 256 * 1024
+MAX_HTTP_ERROR_BYTES = 4096
+NETWORK_TIMEOUT = 15
+
 MAX_TASK_LISTS = 25
 MAX_TASKS = 50
 MAX_TITLE_LEN = 300
@@ -26,73 +33,202 @@ MAX_NOTES_LEN = 1000
 MAX_LIST_TITLE_LEN = 100
 MAX_ERROR_LEN = 250
 
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+FILE_READ_FLAGS = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+
 # Storage directories
 CONFIG_DIR = os.path.expanduser("~/.config/omarchy/plugins/cjkaufman.google-tasks")
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy/cjkaufman.google-tasks")
 
+
 def get_data_dir():
+    """Return verified private storage directory, creating with 0o700 if missing."""
     for d in [CONFIG_DIR, STATE_DIR]:
-        if os.path.exists(d):
+        if os.path.isdir(d):
             return d
-    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
     return CONFIG_DIR
 
-def get_token_path():
-    return os.path.join(get_data_dir(), "token.json")
 
-def get_config_path():
-    return os.path.join(get_data_dir(), "config.json")
+def open_dir_safe(path, create=False):
+    """Open directory descriptor verifying ownership and directory type."""
+    real_path = os.path.realpath(path)
+    if create:
+        os.makedirs(real_path, mode=0o700, exist_ok=True)
+    dir_fd = os.open(real_path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    try:
+        st = os.fstat(dir_fd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(errno.ENOTDIR, f"Not a directory: {path}")
+        if st.st_uid != os.getuid():
+            raise OSError(errno.EACCES, f"Directory not owned by user: {path}")
+        return dir_fd
+    except Exception:
+        os.close(dir_fd)
+        raise
+
+
+def safe_read_file(dir_fd, filename, max_bytes=MAX_FILE_BYTES):
+    """Read a file safely: O_NOFOLLOW, non-blocking, regular file only, owned by user, bounded read."""
+    try:
+        fd = os.open(filename, FILE_READ_FLAGS, dir_fd=dir_fd)
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, f"Not a regular file: {filename}")
+        if st.st_uid != os.getuid():
+            raise OSError(errno.EACCES, f"File not owned by user: {filename}")
+        if st.st_nlink != 1:
+            raise OSError(errno.EINVAL, f"File has unexpected link count: {filename}")
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise OSError(errno.EACCES, f"File is group/world writable: {filename}")
+        if st.st_size > max_bytes:
+            raise OSError(errno.EFBIG, f"File exceeds size limit ({max_bytes} bytes): {filename}")
+
+        os.set_blocking(fd, True)
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise OSError(errno.EFBIG, f"File exceeds size limit ({max_bytes} bytes): {filename}")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def safe_read_json(dir_path, filename):
+    """Safely read and parse JSON file from a directory."""
+    if not os.path.exists(dir_path):
+        return None
+    try:
+        dir_fd = open_dir_safe(dir_path, create=False)
+    except Exception:
+        return None
+    try:
+        data = safe_read_file(dir_fd, filename, MAX_FILE_BYTES)
+        if not data:
+            return None
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+    finally:
+        os.close(dir_fd)
+
+
+def safe_write_json(dir_path, filename, obj):
+    """Atomically write JSON with 0o600 creation mode, O_NOFOLLOW, and fsync."""
+    payload = json.dumps(obj, indent=2).encode("utf-8")
+    if len(payload) > MAX_FILE_BYTES:
+        raise ValueError(f"Payload exceeds {MAX_FILE_BYTES} bytes")
+
+    dir_fd = open_dir_safe(dir_path, create=True)
+    temp_name = f".{filename}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
+    temp_fd = -1
+    try:
+        temp_fd = os.open(
+            temp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=dir_fd
+        )
+        st = os.fstat(temp_fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise OSError(errno.EACCES, "Invalid temporary file stat")
+
+        view = memoryview(payload)
+        while view:
+            written = os.write(temp_fd, view)
+            if written <= 0:
+                raise OSError(errno.EIO, "Short write to temp file")
+            view = view[written:]
+        os.fsync(temp_fd)
+        os.close(temp_fd)
+        temp_fd = -1
+
+        os.replace(temp_name, filename, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        temp_name = ""
+        os.fsync(dir_fd)
+    finally:
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        if temp_name:
+            try:
+                os.unlink(temp_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+        os.close(dir_fd)
+
+
+def safe_remove_file(dir_path, filename):
+    """Safely remove a file relative to a verified directory descriptor."""
+    if not os.path.exists(dir_path):
+        return
+    try:
+        dir_fd = open_dir_safe(dir_path, create=False)
+    except Exception:
+        return
+    try:
+        os.unlink(filename, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(dir_fd)
+
 
 def load_config():
-    path = get_config_path()
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    for candidate in [
-        os.path.join(get_data_dir(), "client_secret.json"),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "client_secret.json")
-    ]:
-        if os.path.exists(candidate):
-            try:
-                with open(candidate, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    installed = data.get("installed", data.get("web", {}))
-                    if installed:
-                        return {
-                            "client_id": installed.get("client_id", ""),
-                            "client_secret": installed.get("client_secret", "")
-                        }
-            except Exception:
-                pass
+    cfg = safe_read_json(get_data_dir(), "config.json")
+    if cfg and isinstance(cfg, dict) and cfg.get("client_id") and cfg.get("client_secret"):
+        return cfg
+    for candidate_dir in [get_data_dir(), os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")]:
+        data = safe_read_json(candidate_dir, "client_secret.json")
+        if data and isinstance(data, dict):
+            installed = data.get("installed", data.get("web", {}))
+            if installed and isinstance(installed, dict):
+                return {
+                    "client_id": str(installed.get("client_id", "")).strip(),
+                    "client_secret": str(installed.get("client_secret", "")).strip()
+                }
     return {}
 
+
 def save_config(client_id, client_secret):
-    os.makedirs(get_data_dir(), exist_ok=True)
     config = {"client_id": str(client_id).strip(), "client_secret": str(client_secret).strip()}
-    with open(get_config_path(), "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
-    os.chmod(get_config_path(), 0o600)
+    safe_write_json(get_data_dir(), "config.json", config)
     return config
 
+
 def load_token():
-    path = get_token_path()
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+    tok = safe_read_json(get_data_dir(), "token.json")
+    if tok and isinstance(tok, dict):
+        return tok
     return None
 
+
 def save_token(token_data):
-    os.makedirs(get_data_dir(), exist_ok=True)
-    path = get_token_path()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(token_data, f, indent=2)
-    os.chmod(path, 0o600)
+    safe_write_json(get_data_dir(), "token.json", token_data)
+
+
+def bounded_read_stream(stream, limit):
+    """Read a network/response stream up to `limit` bytes, throwing if exceeded."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = stream.read(min(65536, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            raise RuntimeError(f"Network response exceeded producer limit of {limit} bytes")
+    return b"".join(chunks)
+
 
 def refresh_access_token(token_data, client_id, client_secret):
     refresh_token = token_data.get("refresh_token")
@@ -108,12 +244,21 @@ def refresh_access_token(token_data, client_id, client_secret):
     }).encode("utf-8")
     
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req) as resp:
-        res_data = json.loads(resp.read().decode("utf-8"))
-        token_data["access_token"] = res_data["access_token"]
-        token_data["expires_at"] = time.time() + res_data.get("expires_in", 3600)
-        save_token(token_data)
-        return token_data["access_token"]
+    try:
+        with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT) as resp:
+            raw = bounded_read_stream(resp, MAX_RESPONSE_BYTES)
+            res_data = json.loads(raw.decode("utf-8", errors="replace"))
+            token_data["access_token"] = res_data["access_token"]
+            token_data["expires_at"] = time.time() + res_data.get("expires_in", 3600)
+            save_token(token_data)
+            return token_data["access_token"]
+    except urllib.error.HTTPError as e:
+        err_bytes = bounded_read_stream(e, MAX_HTTP_ERROR_BYTES)
+        err_msg = err_bytes.decode("utf-8", errors="replace")
+        raise RuntimeError(f"Token refresh failed: {err_msg}"[:MAX_ERROR_LEN])
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error during token refresh: {e.reason}"[:MAX_ERROR_LEN])
+
 
 def get_valid_access_token():
     config = load_config()
@@ -133,6 +278,7 @@ def get_valid_access_token():
     
     return refresh_access_token(token_data, client_id, client_secret)
 
+
 def api_request(endpoint, method="GET", body=None, params=None):
     token = get_valid_access_token()
     url = f"https://tasks.googleapis.com/tasks/v1{endpoint}"
@@ -147,19 +293,23 @@ def api_request(endpoint, method="GET", body=None, params=None):
     
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req) as resp:
-            content = resp.read().decode("utf-8")
-            if not content:
+        with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT) as resp:
+            raw = bounded_read_stream(resp, MAX_RESPONSE_BYTES)
+            if not raw:
                 return {}
-            return json.loads(content)
+            return json.loads(raw.decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
-        err_msg = e.read().decode("utf-8")
+        err_bytes = bounded_read_stream(e, MAX_HTTP_ERROR_BYTES)
+        err_msg = err_bytes.decode("utf-8", errors="replace")
         try:
             err_json = json.loads(err_msg)
             msg = err_json.get("error", {}).get("message", err_msg)
             raise RuntimeError(msg[:MAX_ERROR_LEN])
         except Exception:
             raise RuntimeError(f"HTTP {e.code}: {err_msg}"[:MAX_ERROR_LEN])
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error: {e.reason}"[:MAX_ERROR_LEN])
+
 
 class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     auth_code = None
@@ -204,6 +354,7 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+
 def run_oauth_flow(client_id, client_secret, port=8765):
     redirect_uri = f"http://127.0.0.1:{port}/callback"
     scope = "https://www.googleapis.com/auth/tasks"
@@ -244,12 +395,21 @@ def run_oauth_flow(client_id, client_secret, port=8765):
     }).encode("utf-8")
     
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req) as resp:
-        res_data = json.loads(resp.read().decode("utf-8"))
-        res_data["expires_at"] = time.time() + res_data.get("expires_in", 3600)
-        save_token(res_data)
-        save_config(client_id, client_secret)
-        return res_data
+    try:
+        with urllib.request.urlopen(req, timeout=NETWORK_TIMEOUT) as resp:
+            raw = bounded_read_stream(resp, MAX_RESPONSE_BYTES)
+            res_data = json.loads(raw.decode("utf-8", errors="replace"))
+            res_data["expires_at"] = time.time() + res_data.get("expires_in", 3600)
+            save_token(res_data)
+            save_config(client_id, client_secret)
+            return res_data
+    except urllib.error.HTTPError as e:
+        err_bytes = bounded_read_stream(e, MAX_HTTP_ERROR_BYTES)
+        err_msg = err_bytes.decode("utf-8", errors="replace")
+        raise RuntimeError(f"OAuth code exchange failed: {err_msg}"[:MAX_ERROR_LEN])
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error during OAuth: {e.reason}"[:MAX_ERROR_LEN])
+
 
 def handle_action(req):
     action = req.get("action", "")
@@ -274,9 +434,7 @@ def handle_action(req):
         return {"status": "ok", "authenticated": True}
 
     elif action == "logout":
-        token_path = get_token_path()
-        if os.path.exists(token_path):
-            os.remove(token_path)
+        safe_remove_file(get_data_dir(), "token.json")
         return {"status": "ok", "message": "Logged out"}
 
     elif action == "list-lists":
@@ -360,6 +518,7 @@ def handle_action(req):
     else:
         raise ValueError(f"Unknown action: {action}")
 
+
 def main():
     # Read bounded payload from stdin if available, or parse action argument
     if len(sys.argv) > 1 and sys.argv[1] == "status":
@@ -388,6 +547,7 @@ def main():
         err_msg = str(e)[:MAX_ERROR_LEN]
         print(json.dumps({"error": err_msg}), file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
