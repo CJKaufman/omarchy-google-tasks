@@ -289,7 +289,7 @@ def refresh_access_token(token_data, client_id, client_secret):
         raise RuntimeError(f"Network error during token refresh: {e.reason}"[:MAX_ERROR_LEN])
 
 
-def get_valid_access_token():
+def get_valid_access_token(force_refresh=False):
     config = load_config()
     client_id = config.get("client_id") or os.environ.get("GOOGLE_TASKS_CLIENT_ID")
     client_secret = config.get("client_secret") or os.environ.get("GOOGLE_TASKS_CLIENT_SECRET")
@@ -302,13 +302,13 @@ def get_valid_access_token():
         raise ValueError("Not authenticated. Please run the login/auth flow.")
     
     expires_at = token_data.get("expires_at", 0)
-    if time.time() < (expires_at - 60) and token_data.get("access_token"):
+    if not force_refresh and time.time() < (expires_at - 60) and token_data.get("access_token"):
         return token_data["access_token"]
     
     return refresh_access_token(token_data, client_id, client_secret)
 
 
-def api_request(endpoint, method="GET", body=None, params=None):
+def api_request(endpoint, method="GET", body=None, params=None, retry_on_401=True):
     token = get_valid_access_token()
     url = f"https://tasks.googleapis.com/tasks/v1{endpoint}"
     if params:
@@ -328,6 +328,12 @@ def api_request(endpoint, method="GET", body=None, params=None):
                 return {}
             return json.loads(raw.decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
+        if e.code == 401 and retry_on_401:
+            try:
+                get_valid_access_token(force_refresh=True)
+                return api_request(endpoint, method=method, body=body, params=params, retry_on_401=False)
+            except Exception:
+                pass
         err_bytes = bounded_read_stream(e, MAX_HTTP_ERROR_BYTES)
         err_msg = err_bytes.decode("utf-8", errors="replace")
         try:
