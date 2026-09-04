@@ -284,6 +284,11 @@ def refresh_access_token(token_data, client_id, client_secret):
     except urllib.error.HTTPError as e:
         err_bytes = bounded_read_stream(e, MAX_HTTP_ERROR_BYTES)
         err_msg = err_bytes.decode("utf-8", errors="replace")
+        if "invalid_grant" in err_msg:
+            try:
+                safe_remove_file(get_data_dir(), "token.json")
+            except Exception:
+                pass
         raise RuntimeError(f"Token refresh failed: {err_msg}"[:MAX_ERROR_LEN])
     except urllib.error.URLError as e:
         raise RuntimeError(f"Network error during token refresh: {e.reason}"[:MAX_ERROR_LEN])
@@ -455,6 +460,8 @@ def handle_action(req):
         return {
             "configured": bool(cfg.get("client_id") and cfg.get("client_secret")),
             "authenticated": bool(tok and tok.get("refresh_token")),
+            "client_id": cfg.get("client_id", ""),
+            "client_secret": cfg.get("client_secret", ""),
             "config_dir": get_data_dir()
         }
 
@@ -563,6 +570,8 @@ def main():
         out = {
             "configured": bool(cfg.get("client_id") and cfg.get("client_secret")),
             "authenticated": bool(tok and tok.get("refresh_token")),
+            "client_id": cfg.get("client_id", ""),
+            "client_secret": cfg.get("client_secret", ""),
             "config_dir": get_data_dir()
         }
         print(json.dumps(out))

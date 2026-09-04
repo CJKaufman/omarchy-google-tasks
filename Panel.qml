@@ -199,6 +199,11 @@ Panel {
     authProc.running = true
   }
 
+  function logout() {
+    logoutProc.inputPayload = JSON.stringify({ action: "logout" })
+    logoutProc.running = true
+  }
+
   Component.onCompleted: {
     root.checkStatus()
   }
@@ -243,6 +248,12 @@ Panel {
           var res = JSON.parse(String(text || "{}"))
           root.authenticated = res.authenticated === true
           root.isConfigured = res.configured === true
+          if (res.client_id && clientIdInput && clientIdInput.text === "") {
+            clientIdInput.text = res.client_id
+          }
+          if (res.client_secret && clientSecretInput && clientSecretInput.text === "") {
+            clientSecretInput.text = res.client_secret
+          }
           if (root.authenticated && root.taskLists.length === 0) {
             root.fetchLists()
           }
@@ -294,6 +305,27 @@ Panel {
         }
       }
     }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") {
+          console.warn("listListsProc error:", text)
+          try {
+            var err = JSON.parse(text)
+            var errMsg = String(err.error || text)
+            if (errMsg.indexOf("Token refresh failed") !== -1 || errMsg.indexOf("invalid_grant") !== -1 || errMsg.indexOf("Not authenticated") !== -1) {
+              root.authenticated = false
+            }
+            root.statusError = errMsg.substring(0, 250)
+          } catch (e) {
+            if (text.indexOf("Token refresh failed") !== -1 || text.indexOf("invalid_grant") !== -1 || text.indexOf("Not authenticated") !== -1) {
+              root.authenticated = false
+            }
+            root.statusError = String(text).substring(0, 250)
+          }
+        }
+      }
+    }
   }
 
   Process {
@@ -328,6 +360,9 @@ Panel {
           try {
             var err = JSON.parse(text)
             var errMsg = String(err.error || text)
+            if (errMsg.indexOf("Token refresh failed") !== -1 || errMsg.indexOf("invalid_grant") !== -1 || errMsg.indexOf("Not authenticated") !== -1) {
+              root.authenticated = false
+            }
             if (errMsg.indexOf("404") !== -1 || errMsg.indexOf("not found") !== -1 || errMsg.indexOf("notFound") !== -1) {
               root.activeListId = ""
               root.fetchLists()
@@ -335,6 +370,9 @@ Panel {
             }
             root.statusError = errMsg.substring(0, 250)
           } catch (e) {
+            if (text.indexOf("Token refresh failed") !== -1 || text.indexOf("invalid_grant") !== -1 || text.indexOf("Not authenticated") !== -1) {
+              root.authenticated = false
+            }
             if (text.indexOf("404") !== -1 || text.indexOf("not found") !== -1 || text.indexOf("notFound") !== -1) {
               root.activeListId = ""
               root.fetchLists()
@@ -456,6 +494,26 @@ Panel {
             root.statusError = String(text).substring(0, 250)
           }
         }
+      }
+    }
+  }
+
+  Process {
+    id: logoutProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.authenticated = false
+        root.tasks = []
+        root.taskLists = []
+        root.activeListId = ""
+        root.checkStatus()
       }
     }
   }
@@ -606,20 +664,32 @@ Panel {
               anchors.margins: Style.space(12)
               spacing: Style.space(10)
 
-              Text {
-                text: root.authenticated ? "Google Account Connected" : "Connect Google Tasks"
-                textFormat: Text.PlainText
-                color: root.authenticated ? root.accent : root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-                font.bold: true
+              RowLayout {
+                width: parent.width
+                spacing: Style.space(8)
+
+                Text {
+                  Layout.fillWidth: true
+                  text: root.authenticated ? "Google Account Connected" : "Connect Google Tasks"
+                  textFormat: Text.PlainText
+                  color: root.authenticated ? root.accent : root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+
+                Button {
+                  visible: root.authenticated
+                  text: "Sign Out"
+                  onClicked: root.logout()
+                }
               }
 
               Text {
                 visible: !root.authenticated
                 width: parent.width
                 wrapMode: Text.WordWrap
-                text: "Provide your Google Cloud Desktop Client credentials to sign in. See README for 2-minute setup guide."
+                text: root.isConfigured ? "Credentials configured. Click below to sign in with your Google account." : "Provide your Google Cloud Desktop Client credentials to sign in. See README for 2-minute setup guide."
                 textFormat: Text.PlainText
                 color: root.dim
                 font.family: root.fontFamily
