@@ -54,12 +54,69 @@ Panel {
 
   property var tasks: []
   property var optimisticallyCompleted: ({})
+  property bool showCompletedOverride: root.prefShowCompleted
+  property string expandedTaskId: ""
+  property var subtaskParent: null
+  property var reminders: ({})
 
   readonly property string todayStr: isoDate(new Date())
 
   readonly property var openTasks: (tasks || []).filter(function (t) {
     return t.status === "needsAction" && !optimisticallyCompleted[t.id]
   })
+
+  function isTaskCompleted(t) {
+    return Boolean(t && (t.status === "completed" || root.optimisticallyCompleted[t.id]))
+  }
+
+  // Flattens the parent/child task graph into a display order: each task
+  // immediately followed by its subtasks, indented one level. Google Tasks
+  // itself only supports one level of nesting, so depth is not recursed
+  // beyond that in the UI (see the "add subtask" button below, which only
+  // appears on depth-0 rows).
+  //
+  // A completed task is dropped when `showCompleted` is off UNLESS it still
+  // has a visible (incomplete) child -- otherwise completing a parent would
+  // orphan an open subtask out of the list entirely.
+  function buildDisplayList(list, showCompleted) {
+    var byId = ({})
+    var order = []
+    for (var i = 0; i < list.length; i++) {
+      var t = list[i]
+      if (!t || !t.id) continue
+      byId[t.id] = { data: t, children: [] }
+      order.push(t.id)
+    }
+    var roots = []
+    for (var j = 0; j < order.length; j++) {
+      var node = byId[order[j]]
+      var parentId = node.data.parent
+      if (parentId && byId[parentId]) byId[parentId].children.push(node)
+      else roots.push(node)
+    }
+    function flatten(nodes, depth) {
+      var out = []
+      for (var k = 0; k < nodes.length; k++) {
+        var n = nodes[k]
+        var childOut = flatten(n.children, depth + 1)
+        var completedNow = root.isTaskCompleted(n.data)
+        var include = showCompleted || !completedNow || childOut.length > 0
+        if (include) {
+          var row = Object.assign({}, n.data, {
+            depth: depth,
+            hasChildren: n.children.length > 0,
+            completedNow: completedNow
+          })
+          out.push(row)
+          out = out.concat(childOut)
+        }
+      }
+      return out
+    }
+    return flatten(roots, 0)
+  }
+
+  readonly property var displayTasks: root.buildDisplayList(root.tasks || [], root.showCompletedOverride)
 
   readonly property var dueTasks: openTasks.filter(function (t) {
     if (!t.due || t.due === "") return false
@@ -102,6 +159,35 @@ Panel {
     return String(due).substring(0, 10) === root.todayStr
   }
 
+  function dueDateOnly(due) {
+    return due ? String(due).substring(0, 10) : ""
+  }
+
+  readonly property var datePattern: /^\d{4}-\d{2}-\d{2}$/
+  readonly property var dateTimePattern: /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})$/
+
+  function isValidDate(s) {
+    return root.datePattern.test(String(s || ""))
+  }
+
+  // Accepts "YYYY-MM-DD HH:MM" (local time) and returns epoch seconds, or
+  // -1 if the string doesn't parse. Used for local reminder scheduling only
+  // -- never sent to Google.
+  function parseReminderInput(s) {
+    var m = root.dateTimePattern.exec(String(s || "").trim())
+    if (!m) return -1
+    var d = new Date(Number(m[1].substring(0, 4)), Number(m[1].substring(5, 7)) - 1, Number(m[1].substring(8, 10)), Number(m[2]), Number(m[3]), 0, 0)
+    var epoch = d.getTime() / 1000
+    return isFinite(epoch) ? epoch : -1
+  }
+
+  function formatReminderEpoch(epoch) {
+    if (!epoch) return ""
+    var d = new Date(epoch * 1000)
+    var pad = function (n) { return ("0" + n).slice(-2) }
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes())
+  }
+
   // API Process triggers using stdin bounded IPC
   function checkStatus() {
     statusProc.inputPayload = JSON.stringify({ action: "status" })
@@ -122,32 +208,101 @@ Panel {
     listTasksProc.inputPayload = JSON.stringify({
       action: "list-tasks",
       list_id: root.activeListId,
-      show_completed: root.prefShowCompleted
+      show_completed: root.showCompletedOverride
     })
     listTasksProc.running = true
   }
 
-  function quickAddTask(title) {
+  function fetchReminders() {
+    if (!root.authenticated) return
+    listRemindersProc.running = false
+    listRemindersProc.inputPayload = JSON.stringify({ action: "list-reminders" })
+    listRemindersProc.running = true
+  }
+
+  function pollReminders() {
+    if (!root.authenticated) return
+    pollRemindersProc.running = false
+    pollRemindersProc.inputPayload = JSON.stringify({ action: "poll-reminders" })
+    pollRemindersProc.running = true
+  }
+
+  // `dueDate` is an optional "YYYY-MM-DD" string. `parentId` set means this
+  // is a subtask of that task (Google Tasks supports exactly one level).
+  function quickAddTask(title, dueDate, parentId) {
     var clean = String(title || "").trim()
     if (clean === "" || !root.authenticated) return
     var targetList = root.activeListId || (root.taskLists && root.taskLists.length > 0 ? root.taskLists[0].id : "@default")
     root.statusError = ""
+    var due = String(dueDate || "").trim()
+    var parent = String(parentId || "").trim()
     // Optimistic UI addition
     var tempTask = {
       id: "temp_" + Date.now(),
       title: clean,
       notes: "",
       status: "needsAction",
-      due: ""
+      due: due ? due + "T00:00:00.000Z" : "",
+      parent: parent
     }
     root.tasks = [tempTask].concat(root.tasks || [])
-    createTaskProc.running = false
-    createTaskProc.inputPayload = JSON.stringify({
+    var payload = {
       action: "create-task",
       list_id: targetList,
       title: clean
-    })
+    }
+    if (due) payload.due = due + "T00:00:00.000Z"
+    if (parent) payload.parent_id = parent
+    createTaskProc.running = false
+    createTaskProc.inputPayload = JSON.stringify(payload)
     createTaskProc.running = true
+    root.subtaskParent = null
+  }
+
+  // `fields` may include title, notes, due (each optional; due: "" clears it).
+  function updateTask(task, fields) {
+    if (!task || !task.id || !root.authenticated) return
+    var targetList = root.activeListId || (root.taskLists && root.taskLists.length > 0 ? root.taskLists[0].id : "@default")
+    var payload = {
+      action: "update-task",
+      list_id: targetList,
+      task_id: task.id
+    }
+    if (fields.title !== undefined) payload.title = fields.title
+    if (fields.notes !== undefined) payload.notes = fields.notes
+    if (fields.due !== undefined) payload.due = fields.due
+    // Optimistic local patch so the row reflects the edit immediately.
+    root.tasks = (root.tasks || []).map(function (t) {
+      if (t.id !== task.id) return t
+      return Object.assign({}, t, fields)
+    })
+    updateTaskProc.running = false
+    updateTaskProc.inputPayload = JSON.stringify(payload)
+    updateTaskProc.running = true
+  }
+
+  function setReminder(task, epochSeconds) {
+    if (!task || !task.id || !root.authenticated) return
+    setReminderProc.inputPayload = JSON.stringify({
+      action: "set-reminder",
+      task_id: task.id,
+      remind_at_epoch: epochSeconds,
+      title: task.title,
+      list_id: root.activeListId || "@default"
+    })
+    setReminderProc.running = true
+    var next = Object.assign({}, root.reminders)
+    next[task.id] = { remind_at_epoch: epochSeconds, fired: false }
+    root.reminders = next
+  }
+
+  function clearReminder(task) {
+    if (!task || !task.id) return
+    clearReminderProc.inputPayload = JSON.stringify({ action: "clear-reminder", task_id: task.id })
+    clearReminderProc.running = true
+    var next = Object.assign({}, root.reminders)
+    delete next[task.id]
+    root.reminders = next
   }
 
   function toggleTaskComplete(task) {
@@ -230,6 +385,19 @@ Panel {
         checkStatus()
       }
     }
+  }
+
+  // Local reminder check. Runs regardless of whether the panel is open --
+  // this component is mounted for the lifetime of the bar -- since a
+  // reminder has to fire whether or not you're looking at the popup. The
+  // helper process itself fires the desktop notification; this just has to
+  // invoke it periodically.
+  Timer {
+    interval: 20000
+    running: root.authenticated
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.pollReminders()
   }
 
   // Process Handlers (All pass sensitive and private content over stdin)
@@ -343,8 +511,9 @@ Panel {
         try {
           var items = JSON.parse(String(text || "[]"))
           if (Array.isArray(items)) {
-            root.tasks = items.slice(0, 50)
+            root.tasks = items.slice(0, 100)
             root.optimisticallyCompleted = ({})
+            root.fetchReminders()
           }
         } catch (e) {
           console.warn("list-tasks parse error", e)
@@ -468,6 +637,101 @@ Panel {
   }
 
   Process {
+    id: updateTaskProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
+    onExited: root.fetchTasks()
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") {
+          console.warn("updateTaskProc error:", text)
+          try {
+            var err = JSON.parse(text)
+            root.statusError = String(err.error || text).substring(0, 250)
+          } catch (e) {
+            root.statusError = String(text).substring(0, 250)
+          }
+        }
+      }
+    }
+  }
+
+  Process {
+    id: setReminderProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") console.warn("setReminderProc error:", text)
+      }
+    }
+  }
+
+  Process {
+    id: clearReminderProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") console.warn("clearReminderProc error:", text)
+      }
+    }
+  }
+
+  Process {
+    id: listRemindersProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var res = JSON.parse(String(text || "{}"))
+          if (res && typeof res === "object") root.reminders = res
+        } catch (e) {
+          console.warn("list-reminders parse error", e)
+        }
+      }
+    }
+  }
+
+  Process {
+    id: pollRemindersProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
+    onExited: root.fetchReminders()
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") console.warn("pollRemindersProc error:", text)
+      }
+    }
+  }
+
+  Process {
     id: authProc
     command: [root.helper]
     stdinEnabled: true
@@ -552,7 +816,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: addField.activeFocus || clientIdInput.activeFocus || clientSecretInput.activeFocus
+      blocked: addField.activeFocus || clientIdInput.activeFocus || clientSecretInput.activeFocus || dueField.activeFocus || root.expandedTaskId !== ""
       onCloseRequested: root.close()
       onTabRequested: function (dir) { root.switchPanel(dir) }
       onTextKey: function (k) {
@@ -624,6 +888,18 @@ Panel {
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(4)
+
+              PanelActionButton {
+                visible: root.authenticated
+                iconText: root.glyphChecked
+                tooltipText: root.showCompletedOverride ? "Hide completed tasks" : "Show completed tasks"
+                foreground: root.showCompletedOverride ? root.accent : root.foreground
+                fontFamily: root.fontFamily
+                onClicked: {
+                  root.showCompletedOverride = !root.showCompletedOverride
+                  root.fetchTasks()
+                }
+              }
 
               PanelActionButton {
                 iconText: root.glyphRefresh
@@ -802,64 +1078,136 @@ Panel {
           }
 
           // Quick Add Box
-          Rectangle {
+          Column {
             visible: root.authenticated
             width: parent.width
-            implicitHeight: Style.space(38)
-            color: root.cardBg
-            radius: 6
-            border.color: addField.activeFocus ? root.accent : root.borderCol
-            border.width: 1
+            spacing: Style.space(6)
 
-            RowLayout {
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(10)
-              anchors.rightMargin: Style.space(8)
-              spacing: Style.space(6)
+            // Subtask-mode banner. Shown after clicking "+" on a top-level
+            // task; the next quick-add creates a subtask of it instead.
+            Rectangle {
+              visible: root.subtaskParent !== null
+              width: parent.width
+              implicitHeight: Style.space(26)
+              color: root.subtleBg
+              radius: 6
 
-              MouseArea {
-                implicitWidth: Style.space(24)
-                implicitHeight: Style.space(24)
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  root.quickAddTask(addField.text)
-                  addField.text = ""
-                }
+              RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(8)
+                anchors.rightMargin: Style.space(6)
 
                 Text {
-                  anchors.centerIn: parent
-                  text: root.glyphAdd
+                  Layout.fillWidth: true
                   textFormat: Text.PlainText
-                  color: root.accent
+                  elide: Text.ElideRight
+                  text: "Adding subtask to “" + (root.subtaskParent ? String(root.subtaskParent.title) : "") + "”"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                MouseArea {
+                  implicitWidth: Style.space(18)
+                  implicitHeight: Style.space(18)
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.subtaskParent = null
+                  Text {
+                    anchors.centerIn: parent
+                    text: "✕"
+                    textFormat: Text.PlainText
+                    color: root.dim
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+            }
+
+            Rectangle {
+              id: quickAddBox
+              width: parent.width
+              implicitHeight: Style.space(38)
+              color: root.cardBg
+              radius: 6
+              border.color: addField.activeFocus ? root.accent : root.borderCol
+              border.width: 1
+
+              RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(10)
+                anchors.rightMargin: Style.space(8)
+                spacing: Style.space(6)
+
+                MouseArea {
+                  implicitWidth: Style.space(24)
+                  implicitHeight: Style.space(24)
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: quickAddBox.submit()
+
+                  Text {
+                    anchors.centerIn: parent
+                    text: root.glyphAdd
+                    textFormat: Text.PlainText
+                    color: root.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+                }
+
+                TextField {
+                  id: addField
+                  Layout.fillWidth: true
+                  placeholderText: root.subtaskParent ? "Subtask title… (Enter to save)" : "Add a task or reminder… (Enter to save)"
+                  color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
+                  background: null
+                  selectByMouse: true
+                  onAccepted: quickAddBox.submit()
+                  Keys.onReturnPressed: function(event) { quickAddBox.submit(); event.accepted = true }
+                  Keys.onEnterPressed: function(event) { quickAddBox.submit(); event.accepted = true }
+                }
+
+                PanelActionButton {
+                  visible: root.subtaskParent === null
+                  iconText: root.glyphCalendar
+                  tooltipText: dueField.visible ? "Remove due date" : "Set a due date"
+                  foreground: dueField.visible ? root.accent : root.foreground
+                  fontFamily: root.fontFamily
+                  onClicked: {
+                    dueField.visible = !dueField.visible
+                    if (!dueField.visible) dueField.text = ""
+                  }
                 }
               }
 
-              TextField {
-                id: addField
-                Layout.fillWidth: true
-                placeholderText: "Add a task or reminder… (Enter to save)"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-                background: null
-                selectByMouse: true
-                onAccepted: {
-                  root.quickAddTask(text)
-                  text = ""
+              function submit() {
+                if (addField.text.trim() === "") return
+                if (dueField.visible && dueField.text.trim() !== "" && !root.isValidDate(dueField.text)) {
+                  root.statusError = "Due date must be YYYY-MM-DD"
+                  return
                 }
-                Keys.onReturnPressed: function(event) {
-                  root.quickAddTask(text)
-                  text = ""
-                  event.accepted = true
-                }
-                Keys.onEnterPressed: function(event) {
-                  root.quickAddTask(text)
-                  text = ""
-                  event.accepted = true
-                }
+                root.quickAddTask(addField.text, dueField.visible ? dueField.text : "", root.subtaskParent ? root.subtaskParent.id : "")
+                addField.text = ""
+                dueField.text = ""
+                dueField.visible = false
               }
+            }
+
+            TextField {
+              id: dueField
+              visible: false
+              width: parent.width
+              placeholderText: "Due date: YYYY-MM-DD (e.g. " + root.todayStr + ")"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              background: Rectangle {
+                color: root.cardBg
+                border.color: root.borderCol
+                radius: 4
+              }
+              onAccepted: quickAddBox.submit()
             }
           }
 
@@ -870,105 +1218,324 @@ Panel {
             spacing: Style.space(6)
 
             Repeater {
-              model: root.openTasks
+              model: root.displayTasks
               delegate: Rectangle {
                 id: taskCard
                 width: parent.width
-                implicitHeight: cardContent.implicitHeight + Style.space(14)
+                implicitHeight: cardColumn.implicitHeight + Style.space(14)
                 color: root.cardBg
                 radius: 6
                 border.color: root.borderCol
                 border.width: 1
 
-                RowLayout {
-                  id: cardContent
-                  anchors.fill: parent
-                  anchors.margins: Style.space(8)
-                  spacing: Style.space(10)
+                readonly property bool isCompleted: Boolean(modelData && (modelData.status === "completed" || root.optimisticallyCompleted[modelData.id]))
+                readonly property bool isExpanded: Boolean(modelData) && root.expandedTaskId === modelData.id
+                readonly property var reminderInfo: (modelData && root.reminders[modelData.id]) ? root.reminders[modelData.id] : null
 
-                  // Checkbox
-                  MouseArea {
-                    Layout.alignment: Qt.AlignVCenter
-                    implicitWidth: Style.space(24)
-                    implicitHeight: Style.space(24)
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.toggleTaskComplete(modelData)
+                Column {
+                  id: cardColumn
+                  x: Style.space(8)
+                  y: Style.space(7)
+                  width: parent.width - Style.space(16)
+                  spacing: Style.space(8)
 
-                    Text {
-                      anchors.centerIn: parent
-                      text: (modelData && modelData.status === "completed") || Boolean(root.optimisticallyCompleted && root.optimisticallyCompleted[modelData.id]) ? root.glyphChecked : root.glyphUnchecked
-                      textFormat: Text.PlainText
-                      color: (modelData && modelData.status === "completed") || Boolean(root.optimisticallyCompleted && root.optimisticallyCompleted[modelData.id]) ? root.accent : root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.body
+                  RowLayout {
+                    id: cardContent
+                    width: parent.width
+                    spacing: Style.space(10)
+
+                    // Subtask indent
+                    Item {
+                      implicitWidth: (modelData.depth || 0) * Style.space(18)
+                      implicitHeight: 1
+                    }
+
+                    // Checkbox
+                    MouseArea {
+                      Layout.alignment: Qt.AlignVCenter
+                      implicitWidth: Style.space(24)
+                      implicitHeight: Style.space(24)
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.toggleTaskComplete(modelData)
+
+                      Text {
+                        anchors.centerIn: parent
+                        text: taskCard.isCompleted ? root.glyphChecked : root.glyphUnchecked
+                        textFormat: Text.PlainText
+                        color: taskCard.isCompleted ? root.accent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+                    }
+
+                    // Title & Notes -- click to expand the editor
+                    MouseArea {
+                      Layout.fillWidth: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.expandedTaskId = taskCard.isExpanded ? "" : modelData.id
+
+                      ColumnLayout {
+                        width: parent.width
+                        spacing: Style.space(2)
+
+                        RowLayout {
+                          Layout.fillWidth: true
+                          spacing: Style.space(6)
+
+                          Text {
+                            Layout.fillWidth: true
+                            text: String((modelData && modelData.title) || "")
+                            textFormat: Text.PlainText
+                            color: root.foreground
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.body
+                            wrapMode: Text.WordWrap
+                            font.strikeout: taskCard.isCompleted
+                          }
+
+                          Text {
+                            visible: taskCard.reminderInfo !== null && !taskCard.reminderInfo.fired
+                            text: "⏰"
+                            textFormat: Text.PlainText
+                            font.pixelSize: Style.font.caption
+                          }
+                        }
+
+                        Text {
+                          visible: Boolean(modelData && modelData.notes && String(modelData.notes).trim() !== "")
+                          Layout.fillWidth: true
+                          text: String((modelData && modelData.notes) || "")
+                          textFormat: Text.PlainText
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          elide: Text.ElideRight
+                          maximumLineCount: 2
+                        }
+                      }
+                    }
+
+                    // Due Badge
+                    Rectangle {
+                      visible: Boolean(modelData && modelData.due && String(modelData.due) !== "")
+                      implicitWidth: dueText.implicitWidth + Style.space(10)
+                      implicitHeight: Style.space(20)
+                      radius: 10
+                      color: root.isOverdue(modelData ? modelData.due : "") ? root.urgent : (root.isDueToday(modelData ? modelData.due : "") ? root.accent : root.subtleBg)
+
+                      Text {
+                        id: dueText
+                        anchors.centerIn: parent
+                        text: root.formatDue(modelData.due)
+                        textFormat: Text.PlainText
+                        color: (root.isOverdue(modelData.due) || root.isDueToday(modelData.due)) ? "#ffffff" : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.bold: true
+                      }
+                    }
+
+                    // Add subtask -- Google Tasks only supports one level of
+                    // nesting, so this only appears on top-level tasks.
+                    MouseArea {
+                      visible: (modelData.depth || 0) === 0
+                      Layout.alignment: Qt.AlignVCenter
+                      implicitWidth: Style.space(20)
+                      implicitHeight: Style.space(20)
+                      cursorShape: Qt.PointingHandCursor
+                      opacity: 0.6
+                      onClicked: {
+                        root.subtaskParent = modelData
+                        addField.forceActiveFocus()
+                      }
+
+                      Text {
+                        anchors.centerIn: parent
+                        text: root.glyphAdd
+                        textFormat: Text.PlainText
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+
+                    // Delete action
+                    MouseArea {
+                      Layout.alignment: Qt.AlignVCenter
+                      implicitWidth: Style.space(20)
+                      implicitHeight: Style.space(20)
+                      cursorShape: Qt.PointingHandCursor
+                      opacity: 0.6
+                      onClicked: root.deleteTask(modelData)
+
+                      Text {
+                        anchors.centerIn: parent
+                        text: root.glyphTrash
+                        textFormat: Text.PlainText
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
                     }
                   }
 
-                  // Title & Notes
-                  ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: Style.space(2)
-
-                    Text {
-                      Layout.fillWidth: true
-                      text: String((modelData && modelData.title) || "")
-                      textFormat: Text.PlainText
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.body
-                      wrapMode: Text.WordWrap
-                      font.strikeout: (modelData && modelData.status === "completed") || Boolean(root.optimisticallyCompleted && root.optimisticallyCompleted[modelData.id])
-                    }
-
-                    Text {
-                      visible: Boolean(modelData && modelData.notes && String(modelData.notes).trim() !== "")
-                      Layout.fillWidth: true
-                      text: String((modelData && modelData.notes) || "")
-                      textFormat: Text.PlainText
-                      color: root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      elide: Text.ElideRight
-                      maximumLineCount: 2
-                    }
-                  }
-
-                  // Due Badge
+                  // Expanded editor: title, notes, due date, and a local
+                  // reminder time. Google's API has no field for the
+                  // reminder, so it's stored and fired locally (see
+                  // set-reminder/poll-reminders in bin/tasks-helper).
                   Rectangle {
-                    visible: Boolean(modelData && modelData.due && String(modelData.due) !== "")
-                    implicitWidth: dueText.implicitWidth + Style.space(10)
-                    implicitHeight: Style.space(20)
-                    radius: 10
-                    color: root.isOverdue(modelData ? modelData.due : "") ? root.urgent : (root.isDueToday(modelData ? modelData.due : "") ? root.accent : root.subtleBg)
+                    id: detailBox
+                    visible: taskCard.isExpanded
+                    width: parent.width
+                    implicitHeight: visible ? detailCol.implicitHeight + Style.space(20) : 0
+                    color: root.subtleBg
+                    radius: 6
+                    border.color: root.borderCol
+                    border.width: 1
 
-                    Text {
-                      id: dueText
-                      anchors.centerIn: parent
-                      text: root.formatDue(modelData.due)
-                      textFormat: Text.PlainText
-                      color: (root.isOverdue(modelData.due) || root.isDueToday(modelData.due)) ? "#ffffff" : root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      font.bold: true
-                    }
-                  }
+                    property string rowError: ""
 
-                  // Delete action
-                  MouseArea {
-                    Layout.alignment: Qt.AlignVCenter
-                    implicitWidth: Style.space(20)
-                    implicitHeight: Style.space(20)
-                    cursorShape: Qt.PointingHandCursor
-                    opacity: 0.6
-                    onClicked: root.deleteTask(modelData)
+                    Column {
+                      id: detailCol
+                      anchors.fill: parent
+                      anchors.margins: Style.space(10)
+                      spacing: Style.space(6)
 
-                    Text {
-                      anchors.centerIn: parent
-                      text: root.glyphTrash
-                      textFormat: Text.PlainText
-                      color: root.dim
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
+                      TextField {
+                        id: titleField
+                        width: parent.width
+                        text: modelData ? String(modelData.title || "") : ""
+                        placeholderText: "Title"
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        background: Rectangle { color: root.cardBg; border.color: root.borderCol; radius: 4 }
+                      }
+
+                      TextField {
+                        id: notesField
+                        width: parent.width
+                        text: modelData ? String(modelData.notes || "") : ""
+                        placeholderText: "Notes"
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        background: Rectangle { color: root.cardBg; border.color: root.borderCol; radius: 4 }
+                      }
+
+                      TextField {
+                        id: dueEditField
+                        width: parent.width
+                        text: modelData ? root.dueDateOnly(modelData.due) : ""
+                        placeholderText: "Due date: YYYY-MM-DD (blank to clear)"
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        background: Rectangle { color: root.cardBg; border.color: root.borderCol; radius: 4 }
+                      }
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.space(6)
+
+                        Button {
+                          text: "Save"
+                          onClicked: {
+                            var due = dueEditField.text.trim()
+                            if (due !== "" && !root.isValidDate(due)) {
+                              detailBox.rowError = "Due date must be YYYY-MM-DD"
+                              return
+                            }
+                            if (titleField.text.trim() === "") {
+                              detailBox.rowError = "Title cannot be empty"
+                              return
+                            }
+                            detailBox.rowError = ""
+                            root.updateTask(modelData, {
+                              title: titleField.text.trim(),
+                              notes: notesField.text,
+                              due: due !== "" ? due + "T00:00:00.000Z" : ""
+                            })
+                            root.expandedTaskId = ""
+                          }
+                        }
+
+                        Button {
+                          text: "Close"
+                          onClicked: root.expandedTaskId = ""
+                        }
+                      }
+
+                      Rectangle {
+                        width: parent.width
+                        implicitHeight: 1
+                        color: root.borderCol
+                      }
+
+                      Text {
+                        text: "Local reminder (not synced to Google — fires as a desktop notification while Omarchy is running)"
+                        textFormat: Text.PlainText
+                        wrapMode: Text.WordWrap
+                        width: parent.width
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      Text {
+                        visible: taskCard.reminderInfo !== null
+                        text: taskCard.reminderInfo ? (taskCard.reminderInfo.fired ? "Last reminder: " + root.formatReminderEpoch(taskCard.reminderInfo.remind_at_epoch) + " (fired)" : "Reminder set: " + root.formatReminderEpoch(taskCard.reminderInfo.remind_at_epoch)) : ""
+                        textFormat: Text.PlainText
+                        color: root.accent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      RowLayout {
+                        width: parent.width
+                        spacing: Style.space(6)
+
+                        TextField {
+                          id: reminderField
+                          Layout.fillWidth: true
+                          placeholderText: "YYYY-MM-DD HH:MM"
+                          color: root.foreground
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          background: Rectangle { color: root.cardBg; border.color: root.borderCol; radius: 4 }
+                        }
+
+                        Button {
+                          text: "Set"
+                          onClicked: {
+                            var epoch = root.parseReminderInput(reminderField.text)
+                            if (epoch < 0) {
+                              detailBox.rowError = "Reminder must be YYYY-MM-DD HH:MM"
+                              return
+                            }
+                            detailBox.rowError = ""
+                            root.setReminder(modelData, epoch)
+                            reminderField.text = ""
+                          }
+                        }
+
+                        Button {
+                          text: "Clear"
+                          visible: taskCard.reminderInfo !== null
+                          onClicked: root.clearReminder(modelData)
+                        }
+                      }
+
+                      Text {
+                        visible: detailBox.rowError !== ""
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        text: detailBox.rowError
+                        textFormat: Text.PlainText
+                        color: root.urgent
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
                     }
                   }
                 }

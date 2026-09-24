@@ -12,6 +12,7 @@ import errno
 import secrets
 import json
 import time
+import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -21,17 +22,20 @@ import webbrowser
 import threading
 
 MAX_STDIN_BYTES = 65536
-MAX_FILE_BYTES = 65536
+MAX_FILE_BYTES = 131072
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_HTTP_ERROR_BYTES = 4096
 NETWORK_TIMEOUT = 15
+NOTIFY_TIMEOUT = 5
 
 MAX_TASK_LISTS = 25
-MAX_TASKS = 50
+MAX_TASKS = 100
 MAX_TITLE_LEN = 300
 MAX_NOTES_LEN = 1000
 MAX_LIST_TITLE_LEN = 100
 MAX_ERROR_LEN = 250
+MAX_REMINDERS = 200
+REMINDER_RETENTION_SEC = 7 * 86400
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
 FILE_READ_FLAGS = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
@@ -242,6 +246,41 @@ def load_token():
 
 def save_token(token_data):
     safe_write_json(get_data_dir(), "token.json", token_data)
+
+
+def load_reminders():
+    data = safe_read_json(get_data_dir(), "reminders.json")
+    return data if isinstance(data, dict) else {}
+
+
+def save_reminders(reminders):
+    """Prune fired reminders older than the retention window and cap total
+    count before writing, so this file can't grow without bound across a
+    long-running session."""
+    now = time.time()
+    pruned = {}
+    for task_id, r in reminders.items():
+        if not isinstance(r, dict):
+            continue
+        if r.get("fired") and now - float(r.get("remind_at_epoch", 0)) > REMINDER_RETENTION_SEC:
+            continue
+        pruned[task_id] = r
+    if len(pruned) > MAX_REMINDERS:
+        ordered = sorted(pruned.items(), key=lambda kv: float(kv[1].get("remind_at_epoch", 0)), reverse=True)
+        pruned = dict(ordered[:MAX_REMINDERS])
+    safe_write_json(get_data_dir(), "reminders.json", pruned)
+    return pruned
+
+
+def send_notification(title, body):
+    try:
+        subprocess.run(
+            ["notify-send", "-a", "Google Tasks", "-i", "appointment-soon", str(title)[:200], str(body)[:300]],
+            timeout=NOTIFY_TIMEOUT, check=False,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
 
 
 def bounded_read_stream(stream, limit):
@@ -509,7 +548,9 @@ def handle_action(req):
                 "status": "completed" if item.get("status") == "completed" else "needsAction",
                 "due": str(item.get("due", ""))[:50],
                 "completed": str(item.get("completed", ""))[:50],
-                "updated": str(item.get("updated", ""))[:50]
+                "updated": str(item.get("updated", ""))[:50],
+                "parent": str(item.get("parent", ""))[:100],
+                "position": str(item.get("position", ""))[:50]
             })
         return items
 
@@ -523,11 +564,42 @@ def handle_action(req):
             body["notes"] = str(req.get("notes"))[:MAX_NOTES_LEN]
         if req.get("due"):
             body["due"] = str(req.get("due"))[:50]
-        res = api_request(f"/lists/{list_id}/tasks", method="POST", body=body)
+        params = None
+        parent_id = str(req.get("parent_id", "")).strip()[:100]
+        if parent_id:
+            params = {"parent": parent_id}
+        res = api_request(f"/lists/{list_id}/tasks", method="POST", body=body, params=params)
         return {
             "id": str(res.get("id", ""))[:100],
             "title": str(res.get("title", ""))[:MAX_TITLE_LEN],
             "status": str(res.get("status", "needsAction")),
+            "due": str(res.get("due", ""))[:50],
+            "parent": str(res.get("parent", ""))[:100]
+        }
+
+    elif action == "update-task":
+        list_id = str(req.get("list_id", "")).strip() or "@default"
+        task_id = str(req.get("task_id", "")).strip()
+        if not task_id:
+            raise ValueError("Missing task_id")
+        body = {"id": task_id}
+        if "title" in req:
+            title = str(req.get("title") or "").strip()[:MAX_TITLE_LEN]
+            if not title:
+                raise ValueError("Title cannot be empty")
+            body["title"] = title
+        if "notes" in req:
+            body["notes"] = str(req.get("notes") or "")[:MAX_NOTES_LEN]
+        if "due" in req:
+            # Google Tasks clears the due date when it is set to an empty string.
+            body["due"] = str(req.get("due") or "").strip()[:50]
+        if len(body) == 1:
+            raise ValueError("Nothing to update")
+        res = api_request(f"/lists/{list_id}/tasks/{task_id}", method="PATCH", body=body)
+        return {
+            "id": str(res.get("id", ""))[:100],
+            "title": str(res.get("title", ""))[:MAX_TITLE_LEN],
+            "notes": str(res.get("notes", ""))[:MAX_NOTES_LEN],
             "due": str(res.get("due", ""))[:50]
         }
 
@@ -555,7 +627,89 @@ def handle_action(req):
         if not task_id:
             raise ValueError("Missing task_id")
         api_request(f"/lists/{list_id}/tasks/{task_id}", method="DELETE")
+        reminders = load_reminders()
+        if task_id in reminders:
+            del reminders[task_id]
+            save_reminders(reminders)
         return {"status": "ok", "deleted": task_id}
+
+    # ---- Local-only reminders. Google's public Tasks API has no time-of-day
+    # or notification field (`due` is a date only, even in the real app the
+    # "remind me at" feature is a private, unpublished API) -- so a reminder
+    # here is purely local state, never sent to Google, and only fires while
+    # this shell session is running.
+
+    elif action == "set-reminder":
+        task_id = str(req.get("task_id", "")).strip()
+        if not task_id:
+            raise ValueError("Missing task_id")
+        remind_at = req.get("remind_at_epoch")
+        if remind_at is None:
+            raise ValueError("Missing remind_at_epoch")
+        try:
+            remind_at = float(remind_at)
+        except (TypeError, ValueError):
+            raise ValueError("remind_at_epoch must be a number")
+        reminders = load_reminders()
+        reminders[task_id] = {
+            "remind_at_epoch": remind_at,
+            "title": str(req.get("title", ""))[:MAX_TITLE_LEN],
+            "list_id": str(req.get("list_id", "")).strip()[:100] or "@default",
+            "fired": False
+        }
+        save_reminders(reminders)
+        return {"status": "ok"}
+
+    elif action == "clear-reminder":
+        task_id = str(req.get("task_id", "")).strip()
+        if not task_id:
+            raise ValueError("Missing task_id")
+        reminders = load_reminders()
+        if task_id in reminders:
+            del reminders[task_id]
+            save_reminders(reminders)
+        return {"status": "ok"}
+
+    elif action == "list-reminders":
+        reminders = load_reminders()
+        out = {}
+        for task_id, r in reminders.items():
+            if not isinstance(r, dict):
+                continue
+            out[str(task_id)[:100]] = {
+                "remind_at_epoch": r.get("remind_at_epoch"),
+                "fired": bool(r.get("fired"))
+            }
+        return out
+
+    elif action == "poll-reminders":
+        reminders = load_reminders()
+        now = time.time()
+        fired = []
+        changed = False
+        for task_id, r in reminders.items():
+            if not isinstance(r, dict) or r.get("fired"):
+                continue
+            remind_at = r.get("remind_at_epoch")
+            if remind_at is None:
+                continue
+            try:
+                remind_at = float(remind_at)
+            except (TypeError, ValueError):
+                continue
+            if now >= remind_at:
+                r["fired"] = True
+                changed = True
+                fired.append({
+                    "task_id": str(task_id)[:100],
+                    "title": str(r.get("title", ""))[:MAX_TITLE_LEN],
+                    "list_id": str(r.get("list_id", ""))[:100]
+                })
+        if changed:
+            save_reminders(reminders)
+        for f in fired:
+            send_notification("Task reminder", f["title"] or "You have a task due")
+        return {"fired": fired}
 
     else:
         raise ValueError(f"Unknown action: {action}")
