@@ -244,6 +244,20 @@ def save_token(token_data):
     safe_write_json(get_data_dir(), "token.json", token_data)
 
 
+def load_cache():
+    cache = safe_read_json(get_data_dir(), "cache.json")
+    if cache and isinstance(cache, dict):
+        return cache
+    return {"lists": [], "tasks_by_list": {}}
+
+
+def save_cache(cache_obj):
+    try:
+        safe_write_json(get_data_dir(), "cache.json", cache_obj)
+    except Exception:
+        pass
+
+
 def bounded_read_stream(stream, limit):
     """Read a network/response stream up to `limit` bytes, throwing if exceeded."""
     chunks = []
@@ -479,6 +493,9 @@ def handle_action(req):
         safe_remove_file(get_data_dir(), "token.json")
         return {"status": "ok", "message": "Logged out"}
 
+    elif action == "get-cache":
+        return load_cache()
+
     elif action == "list-lists":
         res = api_request("/users/@me/lists", params={"maxResults": str(MAX_TASK_LISTS)})
         lists = []
@@ -487,7 +504,38 @@ def handle_action(req):
                 "id": str(item.get("id", ""))[:100],
                 "title": str(item.get("title", ""))[:MAX_LIST_TITLE_LEN]
             })
+        cache = load_cache()
+        cache["lists"] = lists
+        save_cache(cache)
         return lists
+
+    elif action == "create-list":
+        title = str(req.get("title", "")).strip()[:MAX_LIST_TITLE_LEN]
+        if not title:
+            raise ValueError("Missing title")
+        res = api_request("/users/@me/lists", method="POST", body={"title": title})
+        new_list = {
+            "id": str(res.get("id", ""))[:100],
+            "title": str(res.get("title", ""))[:MAX_LIST_TITLE_LEN]
+        }
+        cache = load_cache()
+        if "lists" in cache and isinstance(cache["lists"], list):
+            cache["lists"].append(new_list)
+            save_cache(cache)
+        return new_list
+
+    elif action == "delete-list":
+        list_id = str(req.get("list_id", "")).strip()
+        if not list_id or list_id == "@default":
+            raise ValueError("Invalid list_id")
+        api_request(f"/users/@me/lists/{list_id}", method="DELETE")
+        cache = load_cache()
+        if "lists" in cache and isinstance(cache["lists"], list):
+            cache["lists"] = [l for l in cache["lists"] if l.get("id") != list_id]
+            if "tasks_by_list" in cache and isinstance(cache["tasks_by_list"], dict) and list_id in cache["tasks_by_list"]:
+                del cache["tasks_by_list"][list_id]
+            save_cache(cache)
+        return {"status": "ok", "deleted": list_id}
 
     elif action == "list-tasks":
         list_id = str(req.get("list_id", "")).strip() or "@default"
@@ -511,6 +559,11 @@ def handle_action(req):
                 "completed": str(item.get("completed", ""))[:50],
                 "updated": str(item.get("updated", ""))[:50]
             })
+        cache = load_cache()
+        if "tasks_by_list" not in cache or not isinstance(cache["tasks_by_list"], dict):
+            cache["tasks_by_list"] = {}
+        cache["tasks_by_list"][list_id] = items
+        save_cache(cache)
         return items
 
     elif action == "create-task":
@@ -531,6 +584,29 @@ def handle_action(req):
             "due": str(res.get("due", ""))[:50]
         }
 
+    elif action == "update-task":
+        list_id = str(req.get("list_id", "")).strip() or "@default"
+        task_id = str(req.get("task_id", "")).strip()
+        if not task_id:
+            raise ValueError("Missing task_id")
+        body = {"id": task_id}
+        if "title" in req:
+            body["title"] = str(req["title"]).strip()[:MAX_TITLE_LEN]
+        if "notes" in req:
+            body["notes"] = str(req["notes"])[:MAX_NOTES_LEN]
+        if "due" in req:
+            due_val = req["due"]
+            body["due"] = str(due_val)[:50] if due_val else None
+        res = api_request(f"/lists/{list_id}/tasks/{task_id}", method="PATCH", body=body)
+        return {
+            "id": str(res.get("id", ""))[:100],
+            "title": str(res.get("title", ""))[:MAX_TITLE_LEN],
+            "notes": str(res.get("notes", ""))[:MAX_NOTES_LEN],
+            "status": str(res.get("status", "needsAction")),
+            "due": str(res.get("due", ""))[:50],
+            "updated": str(res.get("updated", ""))[:50]
+        }
+
     elif action == "complete-task":
         list_id = str(req.get("list_id", "")).strip() or "@default"
         task_id = str(req.get("task_id", "")).strip()
@@ -548,6 +624,11 @@ def handle_action(req):
         body = {"id": task_id, "status": "needsAction", "completed": None}
         api_request(f"/lists/{list_id}/tasks/{task_id}", method="PATCH", body=body)
         return {"status": "ok", "id": task_id}
+
+    elif action == "clear-completed":
+        list_id = str(req.get("list_id", "")).strip() or "@default"
+        api_request(f"/lists/{list_id}/clear", method="POST")
+        return {"status": "ok", "list_id": list_id}
 
     elif action == "delete-task":
         list_id = str(req.get("list_id", "")).strip() or "@default"
