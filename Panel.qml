@@ -1232,6 +1232,27 @@ Panel {
                 readonly property bool isExpanded: Boolean(modelData) && root.expandedTaskId === modelData.id
                 readonly property var reminderInfo: (modelData && root.reminders[modelData.id]) ? root.reminders[modelData.id] : null
 
+                // Background click-catcher for "click the row to expand".
+                // A sibling of cardColumn, not a child of it: Column
+                // explicitly forbids anchors.fill/top/bottom/centerIn on its
+                // own children (it positions children itself and logs
+                // "Column will not function" if you fight that) -- and it
+                // meant it, the whole Column's stacking broke and every row
+                // in the list overlapped the next. Declared before
+                // cardColumn so it paints underneath it: cardContent's own
+                // icons (checkbox, +, trash), being later siblings, take
+                // priority over this for their own area, and only the
+                // title/notes area -- which has no MouseArea of its own --
+                // falls through to this one.
+                MouseArea {
+                  x: cardColumn.x
+                  y: cardColumn.y
+                  width: cardContent.width
+                  height: cardContent.height
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.expandedTaskId = taskCard.isExpanded ? "" : modelData.id
+                }
+
                 Column {
                   id: cardColumn
                   x: Style.space(8)
@@ -1239,22 +1260,30 @@ Panel {
                   width: parent.width - Style.space(16)
                   spacing: Style.space(8)
 
-                  RowLayout {
+                  // Anchors, not RowLayout/ColumnLayout, for this row.
+                  // RowLayout computes each child's implicit size in a
+                  // negotiation pass that doesn't reliably re-run once a
+                  // wrapped Text's final width (assigned via fillWidth)
+                  // changes its implicitHeight -- the row's own height stuck
+                  // at a too-small guess, so a multi-line title rendered
+                  // past the bottom of its card into the next one. Anchors
+                  // avoid the whole class of bug: checkbox and rightIcons
+                  // get concrete widths first, titleCol's width is resolved
+                  // directly from their edges (not negotiated), so its
+                  // wrapped Text computes the right implicitHeight on the
+                  // very first layout pass.
+                  Item {
                     id: cardContent
                     width: parent.width
-                    spacing: Style.space(10)
+                    implicitHeight: Math.max(Style.space(24), titleCol.implicitHeight)
 
-                    // Subtask indent
-                    Item {
-                      implicitWidth: (modelData.depth || 0) * Style.space(18)
-                      implicitHeight: 1
-                    }
-
-                    // Checkbox
                     MouseArea {
-                      Layout.alignment: Qt.AlignVCenter
-                      implicitWidth: Style.space(24)
-                      implicitHeight: Style.space(24)
+                      id: checkbox
+                      anchors.left: parent.left
+                      anchors.leftMargin: (modelData.depth || 0) * Style.space(18)
+                      anchors.verticalCenter: titleCol.verticalCenter
+                      width: Style.space(24)
+                      height: Style.space(24)
                       cursorShape: Qt.PointingHandCursor
                       onClicked: root.toggleTaskComplete(modelData)
 
@@ -1268,113 +1297,104 @@ Panel {
                       }
                     }
 
-                    // Title & Notes -- click to expand the editor
-                    MouseArea {
-                      Layout.fillWidth: true
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: root.expandedTaskId = taskCard.isExpanded ? "" : modelData.id
+                    Row {
+                      id: rightIcons
+                      anchors.right: parent.right
+                      anchors.verticalCenter: titleCol.verticalCenter
+                      spacing: Style.space(10)
 
-                      ColumnLayout {
-                        width: parent.width
-                        spacing: Style.space(2)
+                      // Due Badge
+                      Rectangle {
+                        visible: Boolean(modelData && modelData.due && String(modelData.due) !== "")
+                        width: dueText.implicitWidth + Style.space(10)
+                        height: Style.space(20)
+                        radius: 10
+                        color: root.isOverdue(modelData ? modelData.due : "") ? root.urgent : (root.isDueToday(modelData ? modelData.due : "") ? root.accent : root.subtleBg)
 
-                        RowLayout {
-                          Layout.fillWidth: true
-                          spacing: Style.space(6)
+                        Text {
+                          id: dueText
+                          anchors.centerIn: parent
+                          text: root.formatDue(modelData.due)
+                          textFormat: Text.PlainText
+                          color: (root.isOverdue(modelData.due) || root.isDueToday(modelData.due)) ? "#ffffff" : root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: true
+                        }
+                      }
 
-                          Text {
-                            Layout.fillWidth: true
-                            text: String((modelData && modelData.title) || "")
-                            textFormat: Text.PlainText
-                            color: root.foreground
-                            font.family: root.fontFamily
-                            font.pixelSize: Style.font.body
-                            wrapMode: Text.WordWrap
-                            font.strikeout: taskCard.isCompleted
-                          }
-
-                          Text {
-                            visible: taskCard.reminderInfo !== null && !taskCard.reminderInfo.fired
-                            text: "⏰"
-                            textFormat: Text.PlainText
-                            font.pixelSize: Style.font.caption
-                          }
+                      // Add subtask -- Google Tasks only supports one level
+                      // of nesting, so this only appears on top-level tasks.
+                      MouseArea {
+                        visible: (modelData.depth || 0) === 0
+                        width: Style.space(20)
+                        height: Style.space(20)
+                        cursorShape: Qt.PointingHandCursor
+                        opacity: 0.6
+                        onClicked: {
+                          root.subtaskParent = modelData
+                          addField.forceActiveFocus()
                         }
 
                         Text {
-                          visible: Boolean(modelData && modelData.notes && String(modelData.notes).trim() !== "")
-                          Layout.fillWidth: true
-                          text: String((modelData && modelData.notes) || "")
+                          anchors.centerIn: parent
+                          text: root.glyphAdd
                           textFormat: Text.PlainText
                           color: root.dim
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.caption
-                          elide: Text.ElideRight
-                          maximumLineCount: 2
+                        }
+                      }
+
+                      // Delete action
+                      MouseArea {
+                        width: Style.space(20)
+                        height: Style.space(20)
+                        cursorShape: Qt.PointingHandCursor
+                        opacity: 0.6
+                        onClicked: root.deleteTask(modelData)
+
+                        Text {
+                          anchors.centerIn: parent
+                          text: root.glyphTrash
+                          textFormat: Text.PlainText
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
                         }
                       }
                     }
 
-                    // Due Badge
-                    Rectangle {
-                      visible: Boolean(modelData && modelData.due && String(modelData.due) !== "")
-                      implicitWidth: dueText.implicitWidth + Style.space(10)
-                      implicitHeight: Style.space(20)
-                      radius: 10
-                      color: root.isOverdue(modelData ? modelData.due : "") ? root.urgent : (root.isDueToday(modelData ? modelData.due : "") ? root.accent : root.subtleBg)
+                    Column {
+                      id: titleCol
+                      anchors.left: checkbox.right
+                      anchors.leftMargin: Style.space(10)
+                      anchors.right: rightIcons.left
+                      anchors.rightMargin: Style.space(10)
+                      anchors.top: parent.top
+                      spacing: Style.space(2)
 
                       Text {
-                        id: dueText
-                        anchors.centerIn: parent
-                        text: root.formatDue(modelData.due)
+                        width: parent.width
+                        text: String((modelData && modelData.title) || "") + (taskCard.reminderInfo !== null && !taskCard.reminderInfo.fired ? "  ⏰" : "")
                         textFormat: Text.PlainText
-                        color: (root.isOverdue(modelData.due) || root.isDueToday(modelData.due)) ? "#ffffff" : root.dim
+                        color: root.foreground
                         font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        font.bold: true
-                      }
-                    }
-
-                    // Add subtask -- Google Tasks only supports one level of
-                    // nesting, so this only appears on top-level tasks.
-                    MouseArea {
-                      visible: (modelData.depth || 0) === 0
-                      Layout.alignment: Qt.AlignVCenter
-                      implicitWidth: Style.space(20)
-                      implicitHeight: Style.space(20)
-                      cursorShape: Qt.PointingHandCursor
-                      opacity: 0.6
-                      onClicked: {
-                        root.subtaskParent = modelData
-                        addField.forceActiveFocus()
+                        font.pixelSize: Style.font.body
+                        wrapMode: Text.WordWrap
+                        font.strikeout: taskCard.isCompleted
                       }
 
                       Text {
-                        anchors.centerIn: parent
-                        text: root.glyphAdd
+                        visible: Boolean(modelData && modelData.notes && String(modelData.notes).trim() !== "")
+                        width: parent.width
+                        text: String((modelData && modelData.notes) || "")
                         textFormat: Text.PlainText
                         color: root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
-                      }
-                    }
-
-                    // Delete action
-                    MouseArea {
-                      Layout.alignment: Qt.AlignVCenter
-                      implicitWidth: Style.space(20)
-                      implicitHeight: Style.space(20)
-                      cursorShape: Qt.PointingHandCursor
-                      opacity: 0.6
-                      onClicked: root.deleteTask(modelData)
-
-                      Text {
-                        anchors.centerIn: parent
-                        text: root.glyphTrash
-                        textFormat: Text.PlainText
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                        maximumLineCount: 2
                       }
                     }
                   }
