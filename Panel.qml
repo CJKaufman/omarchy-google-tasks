@@ -57,6 +57,8 @@ Panel {
 
   property var tasks: []
   property var optimisticallyCompleted: ({})
+  property var subtaskParent: null
+  property var reminders: ({})
 
   // Enhancement state
   property bool completedCollapsed: true
@@ -70,6 +72,53 @@ Panel {
   property var notifiedTaskIds: ({})
 
   readonly property string todayStr: isoDate(new Date())
+
+  function isTaskCompleted(t) {
+    return Boolean(t && (t.status === "completed" || root.optimisticallyCompleted[t.id]))
+  }
+
+  // Flattens the parent/child task graph into a display order: each task
+  // immediately followed by its subtasks, indented one level. Google Tasks
+  // itself only supports one level of nesting.
+  function buildDisplayList(list, showCompleted) {
+    var byId = ({})
+    var order = []
+    for (var i = 0; i < list.length; i++) {
+      var t = list[i]
+      if (!t || !t.id) continue
+      byId[t.id] = { data: t, children: [] }
+      order.push(t.id)
+    }
+    var roots = []
+    for (var j = 0; j < order.length; j++) {
+      var node = byId[order[j]]
+      var parentId = node.data.parent
+      if (parentId && byId[parentId]) byId[parentId].children.push(node)
+      else roots.push(node)
+    }
+    function flatten(nodes, depth) {
+      var out = []
+      for (var k = 0; k < nodes.length; k++) {
+        var n = nodes[k]
+        var childOut = flatten(n.children, depth + 1)
+        var completedNow = root.isTaskCompleted(n.data)
+        var include = showCompleted || !completedNow || childOut.length > 0
+        if (include) {
+          var row = Object.assign({}, n.data, {
+            depth: depth,
+            hasChildren: n.children.length > 0,
+            completedNow: completedNow
+          })
+          out.push(row)
+          out = out.concat(childOut)
+        }
+      }
+      return out
+    }
+    return flatten(roots, 0)
+  }
+
+  readonly property var displayTasks: root.buildDisplayList(root.tasks || [], false)
 
   readonly property var openTasks: (tasks || []).filter(function (t) {
     return t.status === "needsAction" && !optimisticallyCompleted[t.id]
@@ -118,6 +167,61 @@ Panel {
   function isDueToday(due) {
     if (!due || due === "") return false
     return String(due).substring(0, 10) === root.todayStr
+  }
+
+  readonly property var dateTimePattern: /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})$/
+
+  function parseReminderInput(s) {
+    var m = root.dateTimePattern.exec(String(s || "").trim())
+    if (!m) return -1
+    var d = new Date(Number(m[1].substring(0, 4)), Number(m[1].substring(5, 7)) - 1, Number(m[1].substring(8, 10)), Number(m[2]), Number(m[3]), 0, 0)
+    var epoch = d.getTime() / 1000
+    return isFinite(epoch) ? epoch : -1
+  }
+
+  function formatReminderEpoch(epoch) {
+    if (!epoch) return ""
+    var d = new Date(epoch * 1000)
+    var pad = function (n) { return ("0" + n).slice(-2) }
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + pad(d.getHours()) + ":" + pad(d.getMinutes())
+  }
+
+  function setReminder(task, epochSeconds) {
+    if (!task || !task.id || !root.authenticated) return
+    setReminderProc.inputPayload = JSON.stringify({
+      action: "set-reminder",
+      task_id: task.id,
+      remind_at_epoch: epochSeconds,
+      title: task.title,
+      list_id: root.activeListId || "@default"
+    })
+    setReminderProc.running = true
+    var next = Object.assign({}, root.reminders)
+    next[task.id] = { remind_at_epoch: epochSeconds, fired: false }
+    root.reminders = next
+  }
+
+  function clearReminder(task) {
+    if (!task || !task.id) return
+    clearReminderProc.inputPayload = JSON.stringify({ action: "clear-reminder", task_id: task.id })
+    clearReminderProc.running = true
+    var next = Object.assign({}, root.reminders)
+    delete next[task.id]
+    root.reminders = next
+  }
+
+  function fetchReminders() {
+    if (!root.authenticated) return
+    listRemindersProc.running = false
+    listRemindersProc.inputPayload = JSON.stringify({ action: "list-reminders" })
+    listRemindersProc.running = true
+  }
+
+  function pollReminders() {
+    if (!root.authenticated) return
+    pollRemindersProc.running = false
+    pollRemindersProc.inputPayload = JSON.stringify({ action: "poll-reminders" })
+    pollRemindersProc.running = true
   }
 
   function parseQuickAdd(rawText) {
@@ -248,6 +352,7 @@ Panel {
     var dueTimestamp = parsed.due || root.quickAddDue
     if (clean === "" || !root.authenticated) return
     var targetList = root.activeListId || (root.taskLists && root.taskLists.length > 0 ? root.taskLists[0].id : "@default")
+    var parentId = root.subtaskParent ? root.subtaskParent.id : ""
     root.statusError = ""
     root.quickAddDue = ""
 
@@ -257,7 +362,8 @@ Panel {
       title: clean,
       notes: "",
       status: "needsAction",
-      due: dueTimestamp
+      due: dueTimestamp,
+      parent: parentId
     }
     root.tasks = [tempTask].concat(root.tasks || [])
     createTaskProc.running = false
@@ -267,8 +373,10 @@ Panel {
       title: clean
     }
     if (dueTimestamp) payload.due = dueTimestamp
+    if (parentId) payload.parent_id = parentId
     createTaskProc.inputPayload = JSON.stringify(payload)
     createTaskProc.running = true
+    root.subtaskParent = null
   }
 
   function startEditingTask(task) {
@@ -398,6 +506,11 @@ Panel {
     var targetList = root.activeListId || (root.taskLists && root.taskLists.length > 0 ? root.taskLists[0].id : "@default")
     // Optimistically remove from local tasks array
     root.tasks = (root.tasks || []).filter(function(t) { return t.id !== task.id })
+    if (root.reminders && root.reminders[task.id]) {
+      var nextRem = Object.assign({}, root.reminders)
+      delete nextRem[task.id]
+      root.reminders = nextRem
+    }
     deleteTaskProc.inputPayload = JSON.stringify({
       action: "delete-task",
       list_id: targetList,
@@ -452,6 +565,15 @@ Panel {
         checkStatus()
       }
     }
+  }
+
+  // Local reminder check. Runs every 20s while authenticated.
+  Timer {
+    interval: 20000
+    running: root.authenticated
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.pollReminders()
   }
 
   // Process Handlers (All pass sensitive and private content over stdin)
@@ -565,9 +687,10 @@ Panel {
         try {
           var items = JSON.parse(String(text || "[]"))
           if (Array.isArray(items)) {
-            root.tasks = items.slice(0, 50)
+            root.tasks = items.slice(0, 100)
             root.optimisticallyCompleted = ({})
             root.checkDueNotifications()
+            root.fetchReminders()
           }
         } catch (e) {
           console.warn("list-tasks parse error", e)
@@ -830,6 +953,76 @@ Panel {
   }
 
   Process {
+    id: setReminderProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") console.warn("setReminderProc error:", text)
+      }
+    }
+  }
+
+  Process {
+    id: clearReminderProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") console.warn("clearReminderProc error:", text)
+      }
+    }
+  }
+
+  Process {
+    id: listRemindersProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var res = JSON.parse(String(text || "{}"))
+          if (res && typeof res === "object") root.reminders = res
+        } catch (e) {
+          console.warn("list-reminders parse error", e)
+        }
+      }
+    }
+  }
+
+  Process {
+    id: pollRemindersProc
+    command: [root.helper]
+    stdinEnabled: true
+    property string inputPayload: ""
+    onStarted: {
+      if (inputPayload) write(inputPayload + "\n")
+    }
+    onExited: root.fetchReminders()
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (text && text.trim() !== "") console.warn("pollRemindersProc error:", text)
+      }
+    }
+  }
+
+  Process {
     id: authProc
     command: [root.helper]
     stdinEnabled: true
@@ -914,7 +1107,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: addField.activeFocus || clientIdInput.activeFocus || clientSecretInput.activeFocus
+      blocked: addField.activeFocus || clientIdInput.activeFocus || clientSecretInput.activeFocus || root.editingTaskId !== ""
       onCloseRequested: root.close()
       onTabRequested: function (dir) { root.switchPanel(dir) }
       onTextKey: function (k) {
@@ -1272,6 +1465,45 @@ Panel {
             }
           }
 
+          // Subtask banner
+          Rectangle {
+            visible: root.subtaskParent !== null
+            width: parent.width
+            implicitHeight: Style.space(26)
+            color: root.subtleBg
+            radius: 6
+
+            RowLayout {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(8)
+              anchors.rightMargin: Style.space(6)
+
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                elide: Text.ElideRight
+                text: "Adding subtask to “" + (root.subtaskParent ? String(root.subtaskParent.title) : "") + "”"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              MouseArea {
+                implicitWidth: Style.space(18)
+                implicitHeight: Style.space(18)
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.subtaskParent = null
+                Text {
+                  anchors.centerIn: parent
+                  text: "✕"
+                  textFormat: Text.PlainText
+                  color: root.dim
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+          }
+
           // Quick Add Box
           Rectangle {
             visible: root.authenticated
@@ -1310,7 +1542,7 @@ Panel {
               TextField {
                 id: addField
                 Layout.fillWidth: true
-                placeholderText: "Add task or reminder… (@today, @fri) (Enter)"
+                placeholderText: root.subtaskParent ? "Subtask title… (Enter to save)" : "Add task or reminder… (@today, @fri) (Enter)"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -1464,64 +1696,176 @@ Panel {
             spacing: Style.space(6)
 
             Repeater {
-              model: root.openTasks
+              model: root.displayTasks
               delegate: Rectangle {
                 id: taskCard
                 width: parent.width
-                implicitHeight: cardLayout.implicitHeight + Style.space(14)
+                implicitHeight: cardColumn.implicitHeight + Style.space(14)
                 color: root.cardBg
                 radius: 6
                 border.color: root.editingTaskId === modelData.id ? root.accent : root.borderCol
                 border.width: 1
 
+                readonly property bool isCompleted: root.isTaskCompleted(modelData)
+                readonly property var reminderInfo: (modelData && root.reminders[modelData.id]) ? root.reminders[modelData.id] : null
+
+                // Background click-catcher for click-to-edit placed as sibling of cardColumn
+                MouseArea {
+                  x: cardColumn.x
+                  y: cardColumn.y
+                  width: cardContent.width
+                  height: cardContent.height
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    if (root.editingTaskId === modelData.id) root.cancelEditingTask()
+                    else root.startEditingTask(modelData)
+                  }
+                }
+
                 Column {
-                  id: cardLayout
-                  anchors.fill: parent
-                  anchors.margins: Style.space(8)
+                  id: cardColumn
+                  x: Style.space(8)
+                  y: Style.space(7)
+                  width: parent.width - Style.space(16)
                   spacing: Style.space(8)
 
-                  // Normal Task Row
-                  RowLayout {
+                  Item {
+                    id: cardContent
                     width: parent.width
-                    spacing: Style.space(10)
+                    implicitHeight: Math.max(Style.space(24), titleCol.implicitHeight)
 
                     // Checkbox
                     MouseArea {
-                      Layout.alignment: Qt.AlignVCenter
-                      implicitWidth: Style.space(24)
-                      implicitHeight: Style.space(24)
+                      id: checkbox
+                      anchors.left: parent.left
+                      anchors.leftMargin: (modelData.depth || 0) * Style.space(18)
+                      anchors.verticalCenter: titleCol.verticalCenter
+                      width: Style.space(24)
+                      height: Style.space(24)
                       cursorShape: Qt.PointingHandCursor
                       onClicked: root.toggleTaskComplete(modelData)
 
                       Text {
                         anchors.centerIn: parent
-                        text: (modelData && modelData.status === "completed") || Boolean(root.optimisticallyCompleted && root.optimisticallyCompleted[modelData.id]) ? root.glyphChecked : root.glyphUnchecked
+                        text: taskCard.isCompleted ? root.glyphChecked : root.glyphUnchecked
                         textFormat: Text.PlainText
-                        color: (modelData && modelData.status === "completed") || Boolean(root.optimisticallyCompleted && root.optimisticallyCompleted[modelData.id]) ? root.accent : root.dim
+                        color: taskCard.isCompleted ? root.accent : root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.body
                       }
                     }
 
-                    // Title & Notes
-                    ColumnLayout {
-                      Layout.fillWidth: true
+                    Row {
+                      id: rightIcons
+                      anchors.right: parent.right
+                      anchors.verticalCenter: titleCol.verticalCenter
+                      spacing: Style.space(6)
+
+                      // Due Badge
+                      Rectangle {
+                        visible: Boolean(modelData && modelData.due && String(modelData.due) !== "")
+                        width: dueText.implicitWidth + Style.space(10)
+                        height: Style.space(20)
+                        radius: 10
+                        color: root.isOverdue(modelData ? modelData.due : "") ? root.urgent : (root.isDueToday(modelData ? modelData.due : "") ? root.accent : root.subtleBg)
+
+                        Text {
+                          id: dueText
+                          anchors.centerIn: parent
+                          text: root.formatDue(modelData.due)
+                          textFormat: Text.PlainText
+                          color: (root.isOverdue(modelData.due) || root.isDueToday(modelData.due)) ? "#ffffff" : root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: true
+                        }
+                      }
+
+                      // Add subtask (Google Tasks supports 1-level limit)
+                      MouseArea {
+                        visible: (modelData.depth || 0) === 0
+                        width: Style.space(20)
+                        height: Style.space(20)
+                        cursorShape: Qt.PointingHandCursor
+                        opacity: 0.6
+                        onClicked: {
+                          root.subtaskParent = modelData
+                          addField.forceActiveFocus()
+                        }
+
+                        Text {
+                          anchors.centerIn: parent
+                          text: root.glyphAdd
+                          textFormat: Text.PlainText
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+                      }
+
+                      // Edit action
+                      MouseArea {
+                        width: Style.space(20)
+                        height: Style.space(20)
+                        cursorShape: Qt.PointingHandCursor
+                        opacity: 0.6
+                        onClicked: {
+                          if (root.editingTaskId === modelData.id) root.cancelEditingTask()
+                          else root.startEditingTask(modelData)
+                        }
+
+                        Text {
+                          anchors.centerIn: parent
+                          text: root.glyphEdit
+                          textFormat: Text.PlainText
+                          color: root.editingTaskId === modelData.id ? root.accent : root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+                      }
+
+                      // Delete action
+                      MouseArea {
+                        width: Style.space(20)
+                        height: Style.space(20)
+                        cursorShape: Qt.PointingHandCursor
+                        opacity: 0.6
+                        onClicked: root.deleteTask(modelData)
+
+                        Text {
+                          anchors.centerIn: parent
+                          text: root.glyphTrash
+                          textFormat: Text.PlainText
+                          color: root.dim
+                          font.family: root.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+                      }
+                    }
+
+                    Column {
+                      id: titleCol
+                      anchors.left: checkbox.right
+                      anchors.leftMargin: Style.space(10)
+                      anchors.right: rightIcons.left
+                      anchors.rightMargin: Style.space(10)
+                      anchors.top: parent.top
                       spacing: Style.space(2)
 
                       Text {
-                        Layout.fillWidth: true
-                        text: String((modelData && modelData.title) || "")
+                        width: parent.width
+                        text: String((modelData && modelData.title) || "") + (taskCard.reminderInfo !== null && !taskCard.reminderInfo.fired ? "  ⏰" : "")
                         textFormat: Text.PlainText
                         color: root.foreground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.body
                         wrapMode: Text.WordWrap
-                        font.strikeout: (modelData && modelData.status === "completed") || Boolean(root.optimisticallyCompleted && root.optimisticallyCompleted[modelData.id])
+                        font.strikeout: taskCard.isCompleted
                       }
 
                       Text {
                         visible: Boolean(modelData && modelData.notes && String(modelData.notes).trim() !== "")
-                        Layout.fillWidth: true
+                        width: parent.width
                         text: String((modelData && modelData.notes) || "")
                         textFormat: Text.PlainText
                         color: root.dim
@@ -1529,67 +1873,6 @@ Panel {
                         font.pixelSize: Style.font.caption
                         elide: Text.ElideRight
                         maximumLineCount: 2
-                      }
-                    }
-
-                    // Due Badge
-                    Rectangle {
-                      visible: Boolean(modelData && modelData.due && String(modelData.due) !== "")
-                      implicitWidth: dueText.implicitWidth + Style.space(10)
-                      implicitHeight: Style.space(20)
-                      radius: 10
-                      color: root.isOverdue(modelData ? modelData.due : "") ? root.urgent : (root.isDueToday(modelData ? modelData.due : "") ? root.accent : root.subtleBg)
-
-                      Text {
-                        id: dueText
-                        anchors.centerIn: parent
-                        text: root.formatDue(modelData.due)
-                        textFormat: Text.PlainText
-                        color: (root.isOverdue(modelData.due) || root.isDueToday(modelData.due)) ? "#ffffff" : root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                        font.bold: true
-                      }
-                    }
-
-                    // Edit action
-                    MouseArea {
-                      Layout.alignment: Qt.AlignVCenter
-                      implicitWidth: Style.space(20)
-                      implicitHeight: Style.space(20)
-                      cursorShape: Qt.PointingHandCursor
-                      opacity: 0.6
-                      onClicked: {
-                        if (root.editingTaskId === modelData.id) root.cancelEditingTask()
-                        else root.startEditingTask(modelData)
-                      }
-
-                      Text {
-                        anchors.centerIn: parent
-                        text: root.glyphEdit
-                        textFormat: Text.PlainText
-                        color: root.editingTaskId === modelData.id ? root.accent : root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
-                      }
-                    }
-
-                    // Delete action
-                    MouseArea {
-                      Layout.alignment: Qt.AlignVCenter
-                      implicitWidth: Style.space(20)
-                      implicitHeight: Style.space(20)
-                      cursorShape: Qt.PointingHandCursor
-                      opacity: 0.6
-                      onClicked: root.deleteTask(modelData)
-
-                      Text {
-                        anchors.centerIn: parent
-                        text: root.glyphTrash
-                        textFormat: Text.PlainText
-                        color: root.dim
-                        font.family: root.fontFamily
-                        font.pixelSize: Style.font.caption
                       }
                     }
                   }
@@ -1658,6 +1941,70 @@ Panel {
                         onClicked: root.cancelEditingTask()
                       }
                     }
+
+                    Rectangle {
+                      width: parent.width
+                      implicitHeight: 1
+                      color: root.borderCol
+                    }
+
+                    Text {
+                      text: "Local reminder (fires desktop notification while Omarchy is running)"
+                      textFormat: Text.PlainText
+                      wrapMode: Text.WordWrap
+                      width: parent.width
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Text {
+                      visible: taskCard.reminderInfo !== null
+                      text: taskCard.reminderInfo ? (taskCard.reminderInfo.fired ? "Last reminder: " + root.formatReminderEpoch(taskCard.reminderInfo.remind_at_epoch) + " (fired)" : "Reminder set: " + root.formatReminderEpoch(taskCard.reminderInfo.remind_at_epoch)) : ""
+                      textFormat: Text.PlainText
+                      color: root.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    RowLayout {
+                      width: parent.width
+                      spacing: Style.space(6)
+
+                      TextField {
+                        id: reminderField
+                        Layout.fillWidth: true
+                        placeholderText: "YYYY-MM-DD HH:MM"
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        background: Rectangle {
+                          color: root.subtleBg
+                          border.color: root.borderCol
+                          radius: 4
+                        }
+                      }
+
+                      Button {
+                        text: "Set"
+                        onClicked: {
+                          var epoch = root.parseReminderInput(reminderField.text)
+                          if (epoch < 0) {
+                            root.statusError = "Reminder must be YYYY-MM-DD HH:MM"
+                            return
+                          }
+                          root.statusError = ""
+                          root.setReminder(modelData, epoch)
+                          reminderField.text = ""
+                        }
+                      }
+
+                      Button {
+                        text: "Clear"
+                        visible: taskCard.reminderInfo !== null
+                        onClicked: root.clearReminder(modelData)
+                      }
+                    }
                   }
                 }
               }
@@ -1665,7 +2012,7 @@ Panel {
 
             // Empty state for open tasks
             Item {
-              visible: root.openTasks.length === 0 && !root.scanning
+              visible: root.displayTasks.length === 0 && !root.scanning
               width: parent.width
               implicitHeight: Style.space(60)
 
