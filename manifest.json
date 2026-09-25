@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "cjkaufman.google-tasks",
   "name": "Google Tasks",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Carl Kaufman",
   "license": "MIT",
   "description": "View, manage, and quick-add Google Tasks reminders from the Omarchy bar.",
